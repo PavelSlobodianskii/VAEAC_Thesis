@@ -24,8 +24,7 @@ from VAEAC import VAEAC
 parser = argparse.ArgumentParser(description="Train VAEAC to inpaint.")
 
 parser.add_argument("--model_dir", required=True,
-                    help="Directory containing model.py and where checkpoints "
-                         "will be stored.")
+                    help="Directory where checkpoints will be stored.")
 parser.add_argument("--epochs", type=int, required=True,
                     help="Number of training epochs.")
 parser.add_argument("--train_dataset", required=True,
@@ -49,7 +48,12 @@ num_workers = 0  # Set >0 if your system supports
 
 # ----------------------------- Model --------------------------------------- #
 
-model_module = import_module(f"{args.model_dir}.model")
+# *** Always import the "model.py" module, not model_dir as a package ***
+try:
+    model_module = import_module(f"{args.model_dir}.model")
+except ModuleNotFoundError:
+    model_module = import_module("model")
+
 model = VAEAC(
     model_module.reconstruction_log_prob,
     model_module.proposal_network,
@@ -155,10 +159,13 @@ for epoch in range(args.epochs):
             validation_iwae.append(val_iwae)
             train_vlb.append(avg_vlb)
 
-            # --- Track alpha ---
+            # --- Track alpha if using learnable KL or beta ---
             if hasattr(model, "alpha"):
                 alpha_history.append(model.alpha.item())
                 print(f"Epoch {epoch + 1}, alpha (KL weight): {model.alpha.item():.4f}")
+            if hasattr(model, "beta"):
+                alpha_history.append(model.beta.item())
+                print(f"Epoch {epoch + 1}, beta (MMD weight): {model.beta.item():.4f}")
 
             save_checkpoint(epoch)
 
@@ -210,10 +217,10 @@ plt.figure(figsize=(8, 4))
 plt.plot(validation_iwae, label="Validation IWAE", marker="o")
 plt.plot(train_vlb, label="Train VLB", marker="x")
 if len(alpha_history) > 0:
-    plt.plot(alpha_history, label="KL Alpha", marker="*")
+    plt.plot(alpha_history, label="KL Alpha/Beta", marker="*")
 plt.xlabel("Validation checkpoint")
-plt.ylabel("Loss / Alpha")
-plt.title("Validation IWAE vs Train VLB vs KL Alpha")
+plt.ylabel("Loss / Alpha/Beta")
+plt.title("Validation IWAE vs Train VLB vs KL Alpha/Beta")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
