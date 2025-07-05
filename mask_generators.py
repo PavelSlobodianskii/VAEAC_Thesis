@@ -3,7 +3,6 @@ import torch
 from torchvision import transforms
 from PIL import Image
 
-
 # Mask generator for missing feature imputation
 
 class MCARGenerator:
@@ -24,8 +23,7 @@ class MCARGenerator:
                                                 p=[1 - self.p, self.p])
         bernoulli_mask = torch.from_numpy(bernoulli_mask_numpy).float()
         mask = torch.max(bernoulli_mask, nan_mask)  # logical or
-        return mask
-
+        return mask.to(batch.device)
 
 # Image inpainting mask generators
 
@@ -46,8 +44,7 @@ class ImageMCARGenerator:
         bernoulli_mask = torch.from_numpy(bernoulli_mask_numpy).float()
         repeat_times = [1, num_channels] + [1] * (len(gen_shape) - 2)
         mask = bernoulli_mask.repeat(*repeat_times)
-        return mask
-
+        return mask.to(batch.device)
 
 class FixedRectangleGenerator:
     """
@@ -63,8 +60,7 @@ class FixedRectangleGenerator:
     def __call__(self, batch):
         mask = torch.zeros_like(batch)
         mask[:, :, self.x1: self.x2, self.y1: self.y2] = 1
-        return mask
-
+        return mask.to(batch.device)
 
 class RectangleGenerator:
     """
@@ -94,8 +90,7 @@ class RectangleGenerator:
                        self.max_rect_rel_square * sqr):
                 x1, y1, x2, y2 = self.gen_coordinates(width, height)
             mask[i, :, x1: x2 + 1, y1: y2 + 1] = 1
-        return mask
-
+        return mask.to(batch.device)
 
 class RandomPattern:
     """
@@ -190,8 +185,7 @@ class RandomPattern:
         self.points_used += batch_size * width * height
         if self.update_freq * (self.max_size ** 2) < self.points_used:
             self.regenerate_cache()
-        return res
-
+        return res.to(batch.device)
 
 # Mixture mask generator
 
@@ -208,12 +202,13 @@ class MixtureMaskGenerator:
         w = np.array(self.weights, dtype='float')
         w /= w.sum()
         c_ids = np.random.choice(w.size, batch.shape[0], True, w)
-        mask = torch.zeros_like(batch, device='cpu')
+        device = batch.device
+        mask = torch.zeros_like(batch, device=device)
         for i, gen in enumerate(self.generators):
             ids = np.where(c_ids == i)[0]
             if len(ids) == 0:
                 continue
-            samples = gen(batch[ids])
+            samples = gen(batch[ids]).to(device)
             mask[ids] = samples
         return mask
 
@@ -242,8 +237,7 @@ class GFCGenerator:
         ], [1] * 6)
 
     def __call__(self, batch):
-        return self.generator(batch)
-
+        return self.generator(batch).to(batch.device)
 
 class SIIDGMGenerator:
     """
@@ -279,8 +273,7 @@ class SIIDGMGenerator:
         ], [2, 2, 2, 1, 1, 1, 1])
 
     def __call__(self, batch):
-        return self.generator(batch)
-
+        return self.generator(batch).to(batch.device)
 
 class ImageMaskGenerator:
     """
@@ -298,4 +291,4 @@ class ImageMaskGenerator:
         self.generator = MixtureMaskGenerator([siidgm, gfc, common], [1, 1, 2])
 
     def __call__(self, batch):
-        return self.generator(batch)
+        return self.generator(batch).to(batch.device)

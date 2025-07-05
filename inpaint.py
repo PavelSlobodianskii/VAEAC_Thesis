@@ -61,7 +61,6 @@ model_module = import_module(args.model_dir + '.model')
 model = VAEAC(
     model_module.reconstruction_log_prob,
     model_module.proposal_network,
-    model_module.prior_network,
     model_module.generative_network
 )
 if use_cuda:
@@ -131,7 +130,7 @@ for batch_tuple in iterator:
 
         # to show mask on the model input we use gray color
         model_input_visualization = torch.tensor(groundtruth)
-        model_input_visualization[mask.byte()] = 0.5
+        model_input_visualization[mask.bool()] = 0.5
 
         # save model input visualization
         save_img(model_input_visualization,
@@ -139,11 +138,11 @@ for batch_tuple in iterator:
 
         # in the model input the unobserved part is zeroed
         model_input = torch.tensor(groundtruth)
-        model_input[mask.byte()] = 0
+        model_input[mask.bool()] = 0
 
         img_samples = sampler(img_samples_params)
         for i, sample in enumerate(img_samples):
-            sample[1 - mask.byte()] = 0
+            sample[~mask.bool()] = 0
             sample += model_input
             sample_filename = join(args.out_dir,
                                    '%05d_sample_%03d.jpg' % (image_num, i))
