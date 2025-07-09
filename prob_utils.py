@@ -3,33 +3,27 @@ from torch.distributions import Categorical, Normal
 from torch.nn import Module
 from torch.nn.functional import softplus, softmax
 
-
 def normal_parse_params(params, min_sigma=0):
     """
-    Take a Tensor (e. g. neural network output) and return
-    torch.distributions.Normal distribution.
-    This Normal distribution is component-wise independent,
-    and its dimensionality depends on the input shape.
-    First half of channels is mean of the distribution,
-    the softplus of the second half is std (sigma), so there is
-    no restrictions on the input tensor.
-
-    min_sigma is the minimal value of sigma. I. e. if the above
-    softplus is less than min_sigma, then sigma is clipped
-    from below with value min_sigma. This regularization
-    is required for the numerical stability and may be considered
-    as a neural network architecture choice without any change
-    to the probabilistic model.
+    Take either a Tensor (original) or a (mean, logvar) tuple (new) and return
+    a torch.distributions.Normal distribution. This Normal distribution is
+    component-wise independent, and its dimensionality depends on the input shape.
+    The first half of channels is mean, the softplus of the second half (or exp of logvar) is std (sigma).
     """
-    n = params.shape[0]
-    d = params.shape[1]
-    mu = params[:, :d // 2]
-    sigma_params = params[:, d // 2:]
-    sigma = softplus(sigma_params)
-    sigma = sigma.clamp(min=min_sigma)
+    if isinstance(params, tuple):
+        # New way: params is (mean, logvar)
+        mu, logvar = params
+        sigma = (0.5 * logvar).exp().clamp(min=min_sigma)
+    else:
+        # Original way: params is a tensor, split into mu/sigma
+        n = params.shape[0]
+        d = params.shape[1]
+        mu = params[:, :d // 2]
+        sigma_params = params[:, d // 2:]
+        sigma = softplus(sigma_params)
+        sigma = sigma.clamp(min=min_sigma)
     distr = Normal(mu, sigma)
     return distr
-
 
 def categorical_parse_params_column(params, min_prob=0):
     """
@@ -58,7 +52,6 @@ def categorical_parse_params_column(params, min_prob=0):
     distr = Categorical(probs=params)
     return distr
 
-
 class GaussianLoss(Module):
     """
     Compute reconstruction log probability of groundtruth given
@@ -82,7 +75,6 @@ class GaussianLoss(Module):
         distr = normal_parse_params(distr_params, self.min_sigma)
         log_probs = distr.log_prob(groundtruth) * mask
         return log_probs.view(groundtruth.shape[0], -1).sum(-1)
-
 
 class GaussianCategoricalLoss(Module):
     """
@@ -178,7 +170,6 @@ class GaussianCategoricalLoss(Module):
 
         return torch.cat(log_prob, 1).sum(-1)
 
-
 class CategoricalToOneHotLayer(Module):
     """
     This layer expands categorical features into one-hot vectors, because
@@ -234,7 +225,6 @@ class CategoricalToOneHotLayer(Module):
                 out_cols.append(nan_mask.float())
 
         return torch.cat(out_cols, 1)
-
 
 class GaussianCategoricalSampler(Module):
     """
@@ -293,7 +283,6 @@ class GaussianCategoricalSampler(Module):
 
         return torch.cat(sample, 1)
 
-
 class SetGaussianSigmasToOne(Module):
     """
     This layer is used in missing features imputation. Because the target
@@ -329,3 +318,4 @@ class SetGaussianSigmasToOne(Module):
 
         inverse_softplus = torch.ones_like(distr_params) * 0.54125
         return distr_params * mask[None] + inverse_softplus * (1 - mask)[None]
+
