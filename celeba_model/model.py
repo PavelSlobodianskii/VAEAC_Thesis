@@ -5,24 +5,21 @@ from mask_generators import ImageMaskGenerator
 from nn_utils import ResBlock, MemoryLayer, SkipConnection
 from prob_utils import normal_parse_params, GaussianLoss
 
-
-# sampler from the model generative distribution
-# here we return mean of the Gaussian to avoid white noise
+# Sampler from the model generative distribution
+# Here we return mean of the Gaussian to avoid white noise
 def sampler(params):
     return normal_parse_params(params).mean
-
 
 def optimizer(parameters):
     return Adam(parameters, lr=2e-4)
 
-
-batch_size = 16
+batch_size = 64
 
 reconstruction_log_prob = GaussianLoss()
 
 mask_generator = ImageMaskGenerator()
 
-# improve train computational stability by dividing the loss
+# Improve train computational stability by dividing the loss
 # by this scale factor right before backpropagation
 vlb_scale_factor = 128 ** 2
 
@@ -33,7 +30,10 @@ def MLPBlock(dim):
         nn.Conv2d(dim, dim, 1)
     )
 
-proposal_network = nn.Sequential(
+# =================== SWAPPED NETWORKS (for your experiment) ===================
+
+# --- PRIOR NETWORK (was proposal_network in original code) ---
+prior_network = nn.Sequential(
     nn.Conv2d(6, 8, 1),
     ResBlock(8, 8), ResBlock(8, 8), ResBlock(8, 8), ResBlock(8, 8),
     nn.AvgPool2d(2, 2),
@@ -53,8 +53,10 @@ proposal_network = nn.Sequential(
     nn.AvgPool2d(2, 2), nn.Conv2d(256, 512, 1),
     MLPBlock(512), MLPBlock(512), MLPBlock(512), MLPBlock(512),
 )
+# ------------------------------------------------------------------------------
 
-prior_network = nn.Sequential(
+# --- PROPOSAL NETWORK (was prior_network in original code) ---
+proposal_network = nn.Sequential(
     MemoryLayer('#0'),
     nn.Conv2d(6, 8, 1),
     ResBlock(8, 8), ResBlock(8, 8), ResBlock(8, 8), ResBlock(8, 8),
@@ -82,6 +84,9 @@ prior_network = nn.Sequential(
     nn.AvgPool2d(2, 2), nn.Conv2d(256, 512, 1),
     MLPBlock(512), MLPBlock(512), MLPBlock(512), MLPBlock(512),
 )
+# ------------------------------------------------------------------------------
+
+# =================== END OF SWAP ===================
 
 generative_network = nn.Sequential(
     nn.Conv2d(256, 256, 1),

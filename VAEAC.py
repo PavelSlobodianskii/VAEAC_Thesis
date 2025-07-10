@@ -51,7 +51,7 @@ class VAEAC(Module):
         Copy batch of objects and zero unobserved features.
         """
         observed = torch.tensor(batch)
-        observed[mask.byte()] = 0
+        observed[mask.bool()] = 0
         return observed
 
     def make_latent_distributions(self, batch, mask, no_proposal=False):
