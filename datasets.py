@@ -167,17 +167,17 @@ def load_dataset(name):
         ToTensor(),
         Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
-    celeba_root_dir = '/dbstore/datasets/celebA'  # change it for your system!
+    celeba_root_dir = '/content/vaeac/data/vaeac_project'  # change it for your system!
     celeba_img_dir = join(celeba_root_dir, 'img_align_celeba')
     celeba_partition = join(celeba_root_dir, 'list_eval_partition.txt')
 
     if name == 'celeba_train':
-        return CelebA(
+        # Restrict train set to 10000 samples for fast debugging
+        return LengthBounder(CelebA(
             celeba_img_dir,
             celeba_partition,
             'train',
-            celeba_transforms
-        )
+            celeba_transforms), 10000)
     elif name == 'celeba_val':
         # in order to speed up training we restrict validation set
         # to have only 1024 images
@@ -185,7 +185,7 @@ def load_dataset(name):
             celeba_img_dir,
             celeba_partition,
             'valid',
-            celeba_transforms), 1024)
+            celeba_transforms), 1000)
     elif name == 'celeba_test':
         # in order to demonstrate the inpainting results we don't need
         # the whole test set, so we use 256 test images only
