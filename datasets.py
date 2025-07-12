@@ -167,7 +167,7 @@ def load_dataset(name):
         ToTensor(),
         Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
-    celeba_root_dir = '/content/vaeac/data/vaeac_project'
+    celeba_root_dir = '/content/VAEAC_Thesis/data/vaeac_project'
     celeba_img_dir = join(celeba_root_dir, 'img_align_celeba')  # Folder with .jpg files
     celeba_partition = join(celeba_root_dir, 'list_eval_partition.txt')
 
@@ -179,14 +179,14 @@ def load_dataset(name):
             celeba_img_dir,
             celeba_partition,
             'train',
-            celeba_transforms), 3000)
+            celeba_transforms), 50000)
     elif name == 'celeba_val':
         # Validation set: 1000 images
         return LengthBounder(CelebA(
             celeba_img_dir,
             celeba_partition,
             'valid',
-            celeba_transforms), 1000)
+            celeba_transforms), 3500)
     elif name == 'celeba_test':
         # Test set: 256 images
         return LengthBounder(CelebA(

@@ -12,7 +12,6 @@ from datasets import load_dataset, ZipDatasets
 from train_utils import extend_batch_tuple
 from VAEAC import VAEAC
 
-
 parser = ArgumentParser(description='Inpaint images using a given model.')
 
 parser.add_argument('--model_dir', type=str, action='store', required=True,
@@ -46,13 +45,9 @@ parser.add_argument('--use_last_checkpoint', action='store_true',
 
 args = parser.parse_args()
 
-# Default parameters which are not supposed to be changed from user interface
 use_cuda = torch.cuda.is_available()
 verbose = True
-# Non-zero number of workers cause nasty warnings because of some bug in
-# multiprocess library. It might be fixed now, so maybe it is time to set it
-# to the number of CPU cores in the system.
-num_workers = 0
+num_workers = 4
 
 # import the module with the model networks definitions
 model_module = import_module(args.model_dir + '.model')
@@ -77,6 +72,9 @@ checkpoint_path = join(args.model_dir,
 checkpoint = torch.load(checkpoint_path, map_location=location)
 model.load_state_dict(checkpoint['model_state_dict'])
 
+# === DO NOT OVERRIDE PReLU ALPHAS: use as learned ===
+# (This part is intentionally removed!)
+
 # load images and masks datasets, build a dataloader on top of them
 dataset = load_dataset(args.dataset)
 masks = load_dataset(args.masks)
@@ -84,11 +82,9 @@ dataloader = DataLoader(ZipDatasets(dataset, masks), batch_size=batch_size,
                         shuffle=False, drop_last=False,
                         num_workers=num_workers)
 
-
 # saves inpainting to file
 def save_img(img, path):
     ToPILImage()((img / 2 + 0.5).clamp(0, 1).cpu()).save(path)
-
 
 # create directory for inpaintings, if not exists
 makedirs(args.out_dir, exist_ok=True)
@@ -150,3 +146,5 @@ for batch_tuple in iterator:
             save_img(sample, sample_filename)
 
         image_num += 1
+
+
