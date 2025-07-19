@@ -1,3 +1,8 @@
+# [MODIFIED FOR SWAPPED_NETS EXPERIMENT, July 2025]
+# - Checkpoint names changed to checkpoint_swapped_nets_last.tar / _best.tar
+# - num_workers set to 4
+# - Batch size taken from model.py (set it to 128 there)
+
 from argparse import ArgumentParser
 from importlib import import_module
 from math import ceil
@@ -28,7 +33,7 @@ args = parser.parse_args()
 
 use_cuda = torch.cuda.is_available()
 verbose = True
-num_workers = 0
+num_workers = 4  # changed to 4
 
 model_module = import_module(args.model_dir + '.model')
 model = VAEAC(
@@ -57,9 +62,9 @@ train_vlb = []
 rec_errors = []
 kl_terms = []
 
-if exists(join(args.model_dir, 'last_checkpoint.tar')):
+if exists(join(args.model_dir, 'checkpoint_swapped_nets_last.tar')):
     location = 'cuda' if use_cuda else 'cpu'
-    checkpoint = torch.load(join(args.model_dir, 'last_checkpoint.tar'), map_location=location)
+    checkpoint = torch.load(join(args.model_dir, 'checkpoint_swapped_nets_last.tar'), map_location=location)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     validation_iwae = checkpoint.get('validation_iwae', [])
@@ -68,7 +73,7 @@ if exists(join(args.model_dir, 'last_checkpoint.tar')):
     kl_terms = checkpoint.get('kl_terms', [])
 
 def make_checkpoint(epoch):
-    filename = join(args.model_dir, 'last_checkpoint.tar')
+    filename = join(args.model_dir, 'checkpoint_swapped_nets_last.tar')
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -107,8 +112,8 @@ for epoch in range(args.epochs):
             train_vlb.append(avg_vlb)
             make_checkpoint(epoch)
             if max(validation_iwae[::-1]) <= val_iwae:
-                src_filename = join(args.model_dir, 'last_checkpoint.tar')
-                dst_filename = join(args.model_dir, 'best_checkpoint.tar')
+                src_filename = join(args.model_dir, 'checkpoint_swapped_nets_last.tar')
+                dst_filename = join(args.model_dir, 'checkpoint_swapped_nets_best.tar')
                 copy(src_filename, dst_filename + '.bak')
                 replace(dst_filename + '.bak', dst_filename)
             if verbose:
@@ -191,4 +196,5 @@ plot_path = join(args.model_dir, "loss_curves.png")
 plt.savefig(plot_path)
 plt.close()
 print(f"[INFO] Saved plot to {plot_path}")
+
 

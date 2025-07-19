@@ -52,7 +52,7 @@ verbose = True
 # Non-zero number of workers cause nasty warnings because of some bug in
 # multiprocess library. It might be fixed now, so maybe it is time to set it
 # to the number of CPU cores in the system.
-num_workers = 0
+num_workers = 4
 
 # import the module with the model networks definitions
 model_module = import_module(args.model_dir + '.model')
@@ -72,8 +72,8 @@ sampler = model_module.sampler
 # load the required checkpoint
 location = 'cuda' if use_cuda else 'cpu'
 checkpoint_path = join(args.model_dir,
-                       'last_checkpoint.tar' if args.use_last_checkpoint
-                       else 'best_checkpoint.tar')
+                       'checkpoint_swapped_nets_last.tar' if args.use_last_checkpoint
+                       else 'checkpoint_swapped_nets_best.tar')
 checkpoint = torch.load(checkpoint_path, map_location=location)
 model.load_state_dict(checkpoint['model_state_dict'])
 
