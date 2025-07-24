@@ -1,3 +1,9 @@
+# [MODIFIED FOR SWAPPED_NETS EXPERIMENT, July 2025]
+# - Checkpoint names changed to checkpoint_swapped_nets_last.tar / _best.tar
+# - num_workers set to 4
+# - Batch size taken from model.py (set it to 128 there)
+# - Added --max_train_images for limiting train set size (default: 3500)
+
 from argparse import ArgumentParser
 from importlib import import_module
 from math import ceil
@@ -12,7 +18,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import pickle
 
-from datasets import load_dataset
+from datasets import load_dataset, LengthBounder
 from train_utils import extend_batch, get_validation_iwae
 from VAEAC import VAEAC
 
@@ -24,11 +30,13 @@ parser.add_argument('--train_dataset', type=str, action='store', required=True)
 parser.add_argument('--validation_dataset', type=str, action='store', required=True)
 parser.add_argument('--validation_iwae_num_samples', type=int, action='store', default=25)
 parser.add_argument('--validations_per_epoch', type=int, action='store', default=5)
+parser.add_argument('--max_train_images', type=int, default=3500,
+                    help='Maximum number of training images to use (default: 3500)')
 args = parser.parse_args()
 
 use_cuda = torch.cuda.is_available()
 verbose = True
-num_workers = 0
+num_workers = 4  # changed to 4
 
 model_module = import_module(args.model_dir + '.model')
 model = VAEAC(
@@ -45,7 +53,11 @@ batch_size = model_module.batch_size
 vlb_scale_factor = getattr(model_module, 'vlb_scale_factor', 1)
 mask_generator = model_module.mask_generator
 
+# --------- TRAINING DATASET LIMIT APPLIED HERE ----------
 train_dataset = load_dataset(args.train_dataset)
+train_dataset = LengthBounder(train_dataset, args.max_train_images)
+# --------------------------------------------------------
+
 validation_dataset = load_dataset(args.validation_dataset)
 dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=num_workers)
 val_dataloader = DataLoader(validation_dataset, batch_size=batch_size, shuffle=True, drop_last=False, num_workers=num_workers)
@@ -57,9 +69,9 @@ train_vlb = []
 rec_errors = []
 kl_terms = []
 
-if exists(join(args.model_dir, 'last_checkpoint.tar')):
+if exists(join(args.model_dir, 'checkpoint_swapped_nets_last.tar')):
     location = 'cuda' if use_cuda else 'cpu'
-    checkpoint = torch.load(join(args.model_dir, 'last_checkpoint.tar'), map_location=location)
+    checkpoint = torch.load(join(args.model_dir, 'checkpoint_swapped_nets_last.tar'), map_location=location)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     validation_iwae = checkpoint.get('validation_iwae', [])
@@ -68,7 +80,7 @@ if exists(join(args.model_dir, 'last_checkpoint.tar')):
     kl_terms = checkpoint.get('kl_terms', [])
 
 def make_checkpoint(epoch):
-    filename = join(args.model_dir, 'last_checkpoint.tar')
+    filename = join(args.model_dir, 'checkpoint_swapped_nets_last.tar')
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -107,8 +119,8 @@ for epoch in range(args.epochs):
             train_vlb.append(avg_vlb)
             make_checkpoint(epoch)
             if max(validation_iwae[::-1]) <= val_iwae:
-                src_filename = join(args.model_dir, 'last_checkpoint.tar')
-                dst_filename = join(args.model_dir, 'best_checkpoint.tar')
+                src_filename = join(args.model_dir, 'checkpoint_swapped_nets_last.tar')
+                dst_filename = join(args.model_dir, 'checkpoint_swapped_nets_best.tar')
                 copy(src_filename, dst_filename + '.bak')
                 replace(dst_filename + '.bak', dst_filename)
             if verbose:

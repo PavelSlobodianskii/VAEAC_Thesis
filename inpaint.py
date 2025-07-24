@@ -72,8 +72,8 @@ sampler = model_module.sampler
 # load the required checkpoint
 location = 'cuda' if use_cuda else 'cpu'
 checkpoint_path = join(args.model_dir,
-                       'last_checkpoint.tar' if args.use_last_checkpoint
-                       else 'best_checkpoint.tar')
+                       'checkpoint_swapped_nets_last.tar' if args.use_last_checkpoint
+                       else 'checkpoint_swapped_nets_best.tar')
 checkpoint = torch.load(checkpoint_path, map_location=location)
 model.load_state_dict(checkpoint['model_state_dict'])
 
@@ -130,7 +130,7 @@ for batch_tuple in iterator:
                  join(args.out_dir, '%05d_groundtruth.jpg' % image_num))
 
         # to show mask on the model input we use gray color
-        model_input_visualization = torch.tensor(groundtruth)
+        model_input_visualization = groundtruth.clone()
         model_input_visualization[mask.bool()] = 0.5
 
         # save model input visualization
@@ -138,7 +138,7 @@ for batch_tuple in iterator:
                  join(args.out_dir, '%05d_input.jpg' % image_num))
 
         # in the model input the unobserved part is zeroed
-        model_input = torch.tensor(groundtruth)
+        model_input = groundtruth.clone()
         model_input[mask.bool()] = 0
 
         img_samples = sampler(img_samples_params)
