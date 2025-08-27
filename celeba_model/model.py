@@ -1,9 +1,12 @@
 from torch import nn
 from torch.optim import Adam
 
+
 from mask_generators import ImageMaskGenerator
 from nn_utils import ResBlock, MemoryLayer, SkipConnection
 from prob_utils import normal_parse_params, GaussianLoss
+
+
 
 
 # sampler from the model generative distribution
@@ -12,19 +15,27 @@ def sampler(params):
     return normal_parse_params(params).mean
 
 
+
+
 def optimizer(parameters):
     return Adam(parameters, lr=2e-4)
 
 
-batch_size = 16
+
+
+batch_size = 128
+
 
 reconstruction_log_prob = GaussianLoss()
 
+
 mask_generator = ImageMaskGenerator()
+
 
 # improve train computational stability by dividing the loss
 # by this scale factor right before backpropagation
 vlb_scale_factor = 128 ** 2
+
 
 def MLPBlock(dim):
     return SkipConnection(
@@ -32,6 +43,7 @@ def MLPBlock(dim):
         nn.LeakyReLU(),
         nn.Conv2d(dim, dim, 1)
     )
+
 
 proposal_network = nn.Sequential(
     nn.Conv2d(6, 8, 1),
@@ -53,6 +65,7 @@ proposal_network = nn.Sequential(
     nn.AvgPool2d(2, 2), nn.Conv2d(256, 512, 1),
     MLPBlock(512), MLPBlock(512), MLPBlock(512), MLPBlock(512),
 )
+
 
 prior_network = nn.Sequential(
     MemoryLayer('#0'),
@@ -82,6 +95,7 @@ prior_network = nn.Sequential(
     nn.AvgPool2d(2, 2), nn.Conv2d(256, 512, 1),
     MLPBlock(512), MLPBlock(512), MLPBlock(512), MLPBlock(512),
 )
+
 
 generative_network = nn.Sequential(
     nn.Conv2d(256, 256, 1),
