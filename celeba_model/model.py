@@ -16,7 +16,7 @@ def optimizer(parameters):
     return Adam(parameters, lr=2e-4)
 
 
-batch_size = 16
+batch_size = 128
 
 reconstruction_log_prob = GaussianLoss()
 

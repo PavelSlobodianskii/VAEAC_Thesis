@@ -167,7 +167,7 @@ def load_dataset(name):
         ToTensor(),
         Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5))
     ])
-    celeba_root_dir = '/dbstore/datasets/celebA'  # change it for your system!
+    celeba_root_dir = '/content/vaeac/data/vaeac_project'  # change it for your system!
     celeba_img_dir = join(celeba_root_dir, 'img_align_celeba')
     celeba_partition = join(celeba_root_dir, 'list_eval_partition.txt')
 

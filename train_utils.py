@@ -2,6 +2,8 @@ import torch
 from tqdm import tqdm
 
 
+
+
 def extend_batch(batch, dataloader, batch_size):
     """
     If the batch size is less than batch_size, extends it with
@@ -18,6 +20,8 @@ def extend_batch(batch, dataloader, batch_size):
     return batch
 
 
+
+
 def extend_batch_tuple(batch, dataloader, batch_size):
     """
     The same as extend_batch, but here the batch is a list of tensors
@@ -32,6 +36,8 @@ def extend_batch_tuple(batch, dataloader, batch_size):
                         for nw_t in nw_batch]
         batch = [torch.cat([t, nw_t], 0) for t, nw_t in zip(batch, nw_batch)]
     return batch
+
+
 
 
 def get_validation_iwae(val_dataloader, mask_generator, batch_size,
@@ -62,3 +68,8 @@ def get_validation_iwae(val_dataloader, mask_generator, batch_size,
         if verbose:
             iterator.set_description('Validation IWAE: %g' % avg_iwae)
     return float(avg_iwae)
+
+
+def make_mask_on_batch_device(mask_generator, batch):
+    """Generate mask on CPU and move it to the same device as batch."""
+    return mask_generator(batch.cpu()).to(batch.device)

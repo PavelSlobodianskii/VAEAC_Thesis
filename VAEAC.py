@@ -1,172 +1,219 @@
+# filename: VAEAC.py
 import math
+from typing import Optional, Tuple
 
 import torch
+from torch import nn
 from torch.distributions import kl_divergence
 from torch.nn import Module
 
 from prob_utils import normal_parse_params
 
 
+def _kl(q, p, mode: str = "standard") -> torch.Tensor:
+    """
+    KL utilities for diagonal Gaussians from torch.distributions.
+    mode = "standard"  -> KL(q || p)
+    mode = "symmetric" -> 0.5 * ( KL(q||p) + KL(p||q) )
+    """
+    if mode == "standard":
+        return kl_divergence(q, p)
+    if mode == "symmetric":
+        return 0.5 * (kl_divergence(q, p) + kl_divergence(p, q))
+    raise ValueError(f"Unknown KL mode: {mode}")
+
+
+def softplus_inv(y: float, eps: float = 1e-8) -> float:
+    """
+    Inverse softplus: returns x such that softplus(x) ~= y (for y>0).
+    Useful to initialize a raw parameter so that softplus(raw) = y.
+    """
+    y = max(y, eps)
+    return math.log(math.exp(y) - 1.0)
+
+
 class VAEAC(Module):
     """
-    Variational Autoencoder with Arbitrary Conditioning core model.
-    It is rather flexible, but have several assumptions:
-    + The batch of objects and the mask of unobserved features
-      have the same shape.
-    + The prior and proposal distributions in the latent space
-      are component-wise independent Gaussians.
-    The constructor takes
-    + Prior and proposal network which take as an input the concatenation
-      of the batch of objects and the mask of unobserved features
-      and return the parameters of Gaussians in the latent space.
-      The range of neural networks outputs should not be restricted.
-    + Generative network takes latent representation as an input
-      and returns the parameters of generative distribution
-      p_theta(x_b | z, x_{1 - b}, b), where b is the mask
-      of unobserved features. The information about x_{1 - b} and b
-      can be transmitted to generative network from prior network
-      through nn_utils.MemoryLayer. It is guaranteed that for every batch
-      prior network is always executed before generative network.
-    + Reconstruction log probability. rec_log_prob is a callable
-      which takes (groundtruth, distr_params, mask) as an input
-      and return vector of differentiable log probabilities
-      p_theta(x_b | z, x_{1 - b}, b) for each object of the batch.
-    + Sigma_mu and sigma_sigma are the coefficient of the regularization
-      in the hidden space. The default values correspond to a very weak,
-      almost disappearing regularization, which is suitable for all
-      experimental setups the model was tested on.
+    Original VAEAC core (no network swap).
+
+    Mask semantics: mask==1 means "missing / to be inpainted".
+    - Proposal q(z|x,mask) sees [x, mask]
+    - Prior    p(z|x_obs,mask) sees [x*(1-mask), mask]
     """
-    def __init__(self, rec_log_prob, proposal_network, prior_network,
-                 generative_network, sigma_mu=1e4, sigma_sigma=1e-4):
+
+    def __init__(
+        self,
+        rec_log_prob,
+        proposal_network,
+        prior_network,
+        generative_network,
+        *,
+        # regularizers (unchanged)
+        sigma_mu: float = 1e4,
+        sigma_sigma: float = 1e-4,
+        # diagnostics
+        debug_asserts: bool = False,
+        # ---- KL controls ----
+        kl_mode: str = "standard",          # "standard" or "symmetric"
+        kl_alpha: Optional[float] = 1.0,    # numeric weight; use None if learnable_alpha=True
+        learnable_alpha: bool = False,      # learn alpha during training
+        alpha_init: float = 1.0,            # initial alpha when learnable
+        alpha_max: float = 1e6,             # hard cap for the weight
+        free_bits: float = 0.0,             # "free bits" floor (nats) per-sample KL
+    ):
         super().__init__()
         self.rec_log_prob = rec_log_prob
         self.proposal_network = proposal_network
         self.prior_network = prior_network
         self.generative_network = generative_network
+
         self.sigma_mu = sigma_mu
         self.sigma_sigma = sigma_sigma
+        self.debug_asserts = debug_asserts
 
-    def make_observed(self, batch, mask):
-        """
-        Copy batch of objects and zero unobserved features.
-        """
-        observed = torch.tensor(batch)
-        observed[mask.byte()] = 0
-        return observed
+        self.kl_mode = kl_mode
+        self.free_bits = float(free_bits)
+        self.alpha_max = float(alpha_max)
 
-    def make_latent_distributions(self, batch, mask, no_proposal=False):
-        """
-        Make latent distributions for the given batch and mask.
-        No no_proposal is True, return None instead of proposal distribution.
-        """
-        observed = self.make_observed(batch, mask)
-        if no_proposal:
-            proposal = None
+        if learnable_alpha:
+            raw0 = softplus_inv(alpha_init if alpha_init is not None else 1.0)
+            self.raw_alpha = nn.Parameter(torch.tensor(raw0, dtype=torch.float32))
+            self.learnable_alpha = True
+            self.kl_alpha = None
         else:
-            full_info = torch.cat([batch, mask], 1)
-            proposal_params = self.proposal_network(full_info)
-            proposal = normal_parse_params(proposal_params, 1e-3)
-        prior_params = self.prior_network(torch.cat([observed, mask], 1))
-        prior = normal_parse_params(prior_params, 1e-3)
-        return proposal, prior
+            self.learnable_alpha = False
+            if isinstance(kl_alpha, float) and math.isfinite(kl_alpha):
+                self.kl_alpha = float(kl_alpha)
+            else:
+                self.kl_alpha = 1.0  # safe default
 
-    def prior_regularization(self, prior):
+    # ----------------- masking -----------------
+    @staticmethod
+    def make_observed(batch: torch.Tensor, mask: torch.Tensor, fill_value: float = 0.0) -> torch.Tensor:
         """
-        The prior distribution regularization in the latent space.
-        Though it saves prior distribution parameters from going to infinity,
-        the model usually doesn't diverge even without this regularization.
-        It almost doesn't affect learning process near zero with default
-        regularization parameters which are recommended to be used.
+        batch: [B, C, H, W]
+        mask : [B, 1 or C, H, W], 1 = missing
+        return: x_obs = x * (1 - mask) + fill * mask
         """
-        num_objects = prior.mean.shape[0]
-        mu = prior.mean.view(num_objects, -1)
-        sigma = prior.scale.view(num_objects, -1)
-        mu_regularizer = -(mu ** 2).sum(-1) / 2 / (self.sigma_mu ** 2)
-        sigma_regularizer = (sigma.log() - sigma).sum(-1) * self.sigma_sigma
-        return mu_regularizer + sigma_regularizer
+        if mask.dtype != torch.bool:
+            mask = mask.to(dtype=torch.bool, device=batch.device)
+        if mask.shape[1] == 1 and batch.shape[1] != 1:
+            mask = mask.repeat(1, batch.shape[1], 1, 1)
+        return batch * (~mask) + float(fill_value) * mask
 
-    def batch_vlb(self, batch, mask):
+    # ----------------- latent distributions -----------------
+    def make_latent_distributions(
+        self, batch: torch.Tensor, mask: torch.Tensor, no_proposal: bool = False
+    ):
         """
-        Compute differentiable lower bound for the given batch of objects
-        and mask.
+        Return (q, p) where q = q(z|x,mask), p = p(z|x_obs,mask).
+        If no_proposal=True, return (None, p).
         """
-        proposal, prior = self.make_latent_distributions(batch, mask)
-        prior_regularization = self.prior_regularization(prior)
-        latent = proposal.rsample()
-        rec_params = self.generative_network(latent)
-        rec_loss = self.rec_log_prob(batch, rec_params, mask)
-        kl = kl_divergence(proposal, prior).view(batch.shape[0], -1).sum(-1)
-        return rec_loss - kl + prior_regularization
+        if mask.dtype != torch.bool:
+            mask = mask.to(dtype=torch.bool, device=batch.device)
+        if mask.shape[1] == 1 and batch.shape[1] != 1:
+            mask = mask.repeat(1, batch.shape[1], 1, 1)
 
-    def batch_iwae(self, batch, mask, K):
+        q = None
+        if not no_proposal:
+            full_info = torch.cat([batch, mask.float()], 1)
+            q_params = self.proposal_network(full_info)
+            q = normal_parse_params(q_params, min_sigma=1e-3)
+
+        x_obs = self.make_observed(batch, mask, 0.0)
+        if self.debug_asserts and mask.any():
+            with torch.no_grad():
+                leaked = x_obs[mask].abs().max()
+                assert float(leaked) == 0.0, "Prior input contains non-zero values in masked region!"
+
+        p_in = torch.cat([x_obs, mask.float()], 1)
+        p_params = self.prior_network(p_in)
+        p = normal_parse_params(p_params, min_sigma=1e-3)
+
+        return q, p
+
+    # ----------------- helpers -----------------
+    @torch.no_grad()
+    def latent_means(self, batch: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Returns per-sample flattened mean of q(z|x,mask): [B, D]."""
+        q, _ = self.make_latent_distributions(batch, mask, no_proposal=False)
+        return q.mean.view(q.mean.shape[0], -1)
+
+    def prior_regularization(self, prior) -> torch.Tensor:
+        """Same as the original repository."""
+        B = prior.mean.shape[0]
+        mu = prior.mean.view(B, -1)
+        sigma = prior.scale.view(B, -1)
+        mu_reg = -(mu ** 2).sum(-1) / (2 * (self.sigma_mu ** 2))
+        sigma_reg = (sigma.log() - sigma).sum(-1) * self.sigma_sigma
+        return mu_reg + sigma_reg
+
+    # ----------------- loss -----------------
+    def _alpha_value(self) -> torch.Tensor:
         """
-        Compute IWAE log likelihood estimate with K samples per object.
-        Technically, it is differentiable, but it is recommended to use it
-        for evaluation purposes inside torch.no_grad in order to save memory.
-        With torch.no_grad the method almost doesn't require extra memory
-        for very large K.
-        The method makes K independent passes through generator network,
-        so the batch size is the same as for training with batch_vlb.
+        Returns a scalar tensor α; grads flow when learnable.
         """
-        proposal, prior = self.make_latent_distributions(batch, mask)
-        estimates = []
-        for i in range(K):
-            latent = proposal.rsample()
+        if self.learnable_alpha:
+            alpha = torch.nn.functional.softplus(self.raw_alpha)
+            return torch.clamp(alpha, max=self.alpha_max)
+        # numeric alpha as tensor on correct device
+        dev = next(self.parameters()).device
+        return torch.as_tensor(min(self.kl_alpha, self.alpha_max), dtype=torch.float32, device=dev)
 
-            rec_params = self.generative_network(latent)
-            rec_loss = self.rec_log_prob(batch, rec_params, mask)
+    def _kl_term(self, q, p) -> torch.Tensor:
+        # [B, latent_dims...] -> sum over dims
+        kl = _kl(q, p, self.kl_mode).view(q.mean.shape[0], -1).sum(-1)
+        if self.free_bits > 0.0:
+            kl = torch.clamp(kl, min=self.free_bits)
+        return kl
 
-            prior_log_prob = prior.log_prob(latent)
-            prior_log_prob = prior_log_prob.view(batch.shape[0], -1)
-            prior_log_prob = prior_log_prob.sum(-1)
-
-            proposal_log_prob = proposal.log_prob(latent)
-            proposal_log_prob = proposal_log_prob.view(batch.shape[0], -1)
-            proposal_log_prob = proposal_log_prob.sum(-1)
-
-            estimate = rec_loss + prior_log_prob - proposal_log_prob
-            estimates.append(estimate[:, None])
-
-        return torch.logsumexp(torch.cat(estimates, 1), 1) - math.log(K)
-
-    def generate_samples_params(self, batch, mask, K=1):
+    def batch_vlb(self, batch: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
-        Generate parameters of generative distributions for samples
-        from the given batch.
-        It makes K latent representation for each object from the batch
-        and generate samples from them.
-        The second axis is used to index samples for an object, i. e.
-        if the batch shape is [n x D1 x D2], then the result shape is
-        [n x K x D1 x D2].
-        It is better to use it inside torch.no_grad in order to save memory.
-        With torch.no_grad the method doesn't require extra memory
-        except the memory for the result.
+        ELBO with configurable KL:
+          ELBO = E_q[ log p(x|z,mask) ] - alpha * KL(q||p) + prior_reg
         """
-        _, prior = self.make_latent_distributions(batch, mask)
-        samples_params = []
-        for i in range(K):
-            latent = prior.rsample()
-            sample_params = self.generative_network(latent)
-            samples_params.append(sample_params.unsqueeze(1))
-        return torch.cat(samples_params, 1)
+        q, p = self.make_latent_distributions(batch, mask)
+        z = q.rsample()
+        rec_params = self.generative_network(z)
+        rec_ll = self.rec_log_prob(batch, rec_params, mask)
 
-    def generate_reconstructions_params(self, batch, mask, K=1):
+        alpha = self._alpha_value()
+        kl = self._kl_term(q, p)
+        prior_reg = self.prior_regularization(p)
+
+        return rec_ll - alpha * kl + prior_reg
+
+    def batch_iwae(self, batch: torch.Tensor, mask: torch.Tensor, K: int) -> torch.Tensor:
         """
-        Generate parameters of generative distributions for reconstructions
-        from the given batch.
-        It makes K latent representation for each object from the batch
-        and generate samples from them.
-        The second axis is used to index samples for an object, i. e.
-        if the batch shape is [n x D1 x D2], then the result shape is
-        [n x K x D1 x D2].
-        It is better to use it inside torch.no_grad in order to save memory.
-        With torch.no_grad the method doesn't require extra memory
-        except the memory for the result.
+        IWAE estimate (uses standard importance weights).
         """
-        _, prior = self.make_latent_distributions(batch, mask)
-        reconstructions_params = []
-        for i in range(K):
-            latent = prior.rsample()
-            rec_params = self.generative_network(latent)
-            reconstructions_params.append(rec_params.unsqueeze(1))
-        return torch.cat(reconstructions_params, 1)
+        q, p = self.make_latent_distributions(batch, mask)
+        parts = []
+        for _ in range(K):
+            z = q.rsample()
+            rec_params = self.generative_network(z)
+            rec_ll = self.rec_log_prob(batch, rec_params, mask)
+
+            log_pz = p.log_prob(z).view(batch.shape[0], -1).sum(-1)
+            log_qz = q.log_prob(z).view(batch.shape[0], -1).sum(-1)
+            parts.append((rec_ll + log_pz - log_qz)[:, None])
+        return torch.logsumexp(torch.cat(parts, 1), 1) - math.log(K)
+
+    # ----------------- sampling -----------------
+    @torch.no_grad()
+    def generate_samples_params(self, batch: torch.Tensor, mask: torch.Tensor, K: int = 1) -> torch.Tensor:
+        _, p = self.make_latent_distributions(batch, mask, no_proposal=True)
+        outs = []
+        for _ in range(K):
+            z = p.rsample()
+            outs.append(self.generative_network(z).unsqueeze(1))
+        return torch.cat(outs, 1)
+
+    @torch.no_grad()
+    def generate_reconstructions_params(self, batch: torch.Tensor, mask: torch.Tensor, K: int = 1) -> torch.Tensor:
+        _, p = self.make_latent_distributions(batch, mask, no_proposal=True)
+        outs = []
+        for _ in range(K):
+            z = p.rsample()
+            outs.append(self.generative_network(z).unsqueeze(1))
+        return torch.cat(outs, 1)
