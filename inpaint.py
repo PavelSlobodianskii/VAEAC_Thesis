@@ -30,7 +30,7 @@ p.add_argument('--use_last_checkpoint', action='store_true', default=False,
                help='Use last.tar instead of best.tar.')
 # NEW
 p.add_argument('--checkpoint_dir', type=str, default=None,
-               help='Folder containing best.tar/last.tar (e.g. celeba_model/alpha_runs/alpha_0.0)')
+               help='Folder containing best.tar/last.tar (e.g. celeba_model/alpha_runs/alpha_0.5)')
 p.add_argument('--checkpoint', type=str, default=None,
                help='Explicit path to a checkpoint .tar (overrides the above).')
 
@@ -61,7 +61,7 @@ if args.checkpoint is not None:
     ckpt_path = args.checkpoint
 else:
     root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
-    ckpt_path = join(root, 'last.tar' if args.use_last_checkpoint else 'best.tar')
+    ckpt_path = join(root, 'alpha_runs/alpha_0.5/last.tar' if args.use_last_checkpoint else 'alpha_runs/alpha_0.5/best.tar')
 
 print(f"[INFO] Loading checkpoint: {ckpt_path}")
 checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
