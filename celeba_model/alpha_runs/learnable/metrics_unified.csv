@@ -1,9 +1,0 @@
-num_images,K,fid,ssim,psnr,checkpoint,splits,seed
-256,1,75.1631388400233,0.7820048332214355,21.92458601903508,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-1024,1,56.13523373575421,0.773095965385437,21.598809148741214,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-5000,1,42.43170696533727,0.7723004817962646,21.49817993017635,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-10000,1,40.40117838651699,0.7727957963943481,21.537721966756568,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-256,4,74.44331602196064,0.7871055006980896,22.339070378626886,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-1024,4,55.60207953030107,0.7794908881187439,22.124185469340347,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-5000,4,42.323646823660994,0.7791079878807068,22.044963777244657,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
-10000,4,40.53226507488438,0.7795150279998779,22.072318011232735,/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar,celeba_train,1337
