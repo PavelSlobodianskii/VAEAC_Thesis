@@ -1,0 +1,2 @@
+num_images,K,fid,ssim,psnr,checkpoint,splits,seed
+10000,4,147.12901363033964,0.6261289715766907,14.112592802545457,/content/VAEAC_Thesis/celeba_model/alpha_runs/alpha_inf/best (4).tar,celeba_train,1337
