@@ -1,0 +1,2 @@
+num_images,K,fid,ssim,psnr,checkpoint,splits,seed,amp,batch_size,timestamp
+10000,4,35.422923638090424,0.772601306438446,21.226270523234,celeba_model/alpha_runs/alpha_0.0/best (3) (3).tar,celeba_train,1337,1,128,2025-10-05T12:32:29.187708+00:00
