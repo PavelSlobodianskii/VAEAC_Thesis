@@ -30,7 +30,7 @@ p.add_argument('--use_last_checkpoint', action='store_true', default=False,
                help='Use last.tar instead of best.tar.')
 # NEW
 p.add_argument('--checkpoint_dir', type=str, default=None,
-               help='Folder containing best.tar/last.tar (e.g. celeba_model/alpha_runs/learnable)')
+               help='Folder containing best.tar/last.tar (e.g. celeba_model/alpha_runs/alpha_5.0)')
 p.add_argument('--checkpoint', type=str, default=None,
                help='Explicit path to a checkpoint .tar (overrides the above).')
 
@@ -49,8 +49,8 @@ model = VAEAC(
     model_module.proposal_network,
     model_module.prior_network,
     model_module.generative_network,
-    learnable_alpha=True,   # <-- add this
-    kl_alpha=None           # <-- match training: None when learnable
+    learnable_alpha=False,   # <-- add this
+    kl_alpha= 5.0           # <-- match training: None when learnable
 )
 
 if use_cuda:
@@ -64,7 +64,7 @@ if args.checkpoint is not None:
     ckpt_path = args.checkpoint
 else:
     root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
-    ckpt_path = join(root, 'alpha_runs/learnable/last.tar' if args.use_last_checkpoint else 'alpha_runs/learnable/best.tar')
+    ckpt_path = join(root, 'alpha_runs/alpha_5.0/last (1) (1).tar' if args.use_last_checkpoint else 'alpha_runs/alpha_5.0/best (1) (1).tar')
 
 print(f"[INFO] Loading checkpoint: {ckpt_path}")
 checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
