@@ -49,8 +49,8 @@ model = VAEAC(
     model_module.proposal_network,
     model_module.prior_network,
     model_module.generative_network,
-    learnable_alpha=True,   # <-- add this
-    kl_alpha=None           # <-- match training: None when learnable
+    learnable_alpha=False,   # <-- add this
+    kl_alpha=1.0           # <-- match training: None when learnable
 )
 
 if use_cuda:
@@ -63,8 +63,8 @@ sampler = model_module.sampler
 if args.checkpoint is not None:
     ckpt_path = args.checkpoint
 else:
-    root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
-    ckpt_path = join(root, 'alpha_runs/learnable/last.tar' if args.use_last_checkpoint else 'alpha_runs/learnable/best.tar')
+     root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
+     ckpt_path = join('/content/drive/MyDrive/Checkpoints/Alpha_1.0/last (2).tar' if args.use_last_checkpoint else '/content/drive/MyDrive/Checkpoints/Alpha_1.0/best (2).tar')
 
 print(f"[INFO] Loading checkpoint: {ckpt_path}")
 checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
