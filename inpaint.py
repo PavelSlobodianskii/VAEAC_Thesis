@@ -64,7 +64,7 @@ if args.checkpoint is not None:
     ckpt_path = args.checkpoint
 else:
     root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
-    ckpt_path = join(root, 'last (4).tar' if args.use_last_checkpoint else 'best (4).tar')
+    ckpt_path = join('/content/VAEAC_Thesis/celeba_model/alpha_runs/alpha_inf/last (4) (2).tar' if args.use_last_checkpoint else '/content/VAEAC_Thesis/celeba_model/alpha_runs/alpha_inf/best (4) (1).tar')
 
 
 print(f"[INFO] Loading checkpoint: {ckpt_path}")
