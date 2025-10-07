@@ -64,7 +64,7 @@ if args.checkpoint is not None:
     ckpt_path = args.checkpoint
 else:
     root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
-    ckpt_path = join(root, 'alpha_runs/learnable/last.tar' if args.use_last_checkpoint else 'alpha_runs/learnable/best.tar')
+    ckpt_path = join(root, 'alpha_runs/learnable/last (5).tar' if args.use_last_checkpoint else 'alpha_runs/learnable/best (5).tar')
 
 print(f"[INFO] Loading checkpoint: {ckpt_path}")
 checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
