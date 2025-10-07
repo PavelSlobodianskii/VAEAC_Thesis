@@ -50,7 +50,7 @@ model = VAEAC(
     model_module.prior_network,
     model_module.generative_network,
     learnable_alpha=False,   # <-- add this
-    kl_alpha=None           # <-- match training: None when learnable
+    kl_alpha=1e6           # <-- match training: None when learnable
 )
 
 if use_cuda:
