@@ -5,6 +5,21 @@ from mask_generators import ImageMaskGenerator
 from nn_utils import ResBlock, MemoryLayer, SkipConnection
 from prob_utils import normal_parse_params, GaussianLoss
 
+# Add at top or in losses.py
+class PatchDiscriminator(nn.Module):
+    """
+    PatchGAN discriminator for adversarial loss.
+    """
+    def __init__(self, in_channels=3, ndf=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, ndf, 4, 2, 1), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf, ndf*2, 4, 2, 1), nn.BatchNorm2d(ndf*2), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf*2, ndf*4, 4, 2, 1), nn.BatchNorm2d(ndf*4), nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(ndf*4, 1, 4, 1, 0),  # Output is patch-size
+        )
+    def forward(self, x):
+        return self.net(x)
 
 # sampler from the model generative distribution
 # here we return mean of the Gaussian to avoid white noise

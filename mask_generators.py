@@ -205,15 +205,17 @@ class MixtureMaskGenerator:
         self.weights = weights
 
     def __call__(self, batch):
+        device = batch.device
         w = np.array(self.weights, dtype='float')
         w /= w.sum()
         c_ids = np.random.choice(w.size, batch.shape[0], True, w)
-        mask = torch.zeros_like(batch, device='cpu')
+        mask = torch.zeros_like(batch, device=device)
         for i, gen in enumerate(self.generators):
             ids = np.where(c_ids == i)[0]
             if len(ids) == 0:
                 continue
             samples = gen(batch[ids])
+            samples = samples.to(device)
             mask[ids] = samples
         return mask
 
@@ -299,3 +301,5 @@ class ImageMaskGenerator:
 
     def __call__(self, batch):
         return self.generator(batch)
+
+

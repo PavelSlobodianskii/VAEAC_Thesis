@@ -1,5 +1,4 @@
-# inpaint.py (patched for alpha-runs / explicit checkpoints)
-
+# inpaint.py — patched for thesis/alpha-handling (VAEAC)
 from argparse import ArgumentParser
 from importlib import import_module
 from os import makedirs
@@ -44,32 +43,39 @@ verbose = True
 # import the networks
 model_module = import_module(args.model_dir + '.model')
 
+batch_size = model_module.batch_size
+sampler = model_module.sampler
+
+# ---------------- CHECKPOINT LOGIC AND MODEL LOADING ----------------
+if args.checkpoint is not None:
+    ckpt_path = args.checkpoint
+else:
+    root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
+    ckpt_path = join("/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/last.tar" if args.use_last_checkpoint else "/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar")
+
+print(f"[INFO] Loading checkpoint: {ckpt_path}")
+checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
+
+# Detect if alpha was learnable during training from the checkpoint
+learnable_alpha = "raw_alpha" in checkpoint["model_state_dict"]
+kl_alpha = None if learnable_alpha else checkpoint["model_state_dict"].get("kl_alpha", 1.0)
+
 model = VAEAC(
     model_module.reconstruction_log_prob,
     model_module.proposal_network,
     model_module.prior_network,
     model_module.generative_network,
-    learnable_alpha=False,   # <-- add this
-    kl_alpha=1e6           # <-- match training: None when learnable
+    learnable_alpha=learnable_alpha,
+    kl_alpha=kl_alpha
 )
-
+model.load_state_dict(checkpoint['model_state_dict'])
 if use_cuda:
     model = model.cuda()
 
-batch_size = model_module.batch_size
-sampler = model_module.sampler
-
-# ---------------- CHECKPOINT LOGIC ----------------
-if args.checkpoint is not None:
-    ckpt_path = args.checkpoint
+if learnable_alpha:
+    print(f"[INFO] Using learnable alpha with final value: {float(model._alpha_value().item()):.5f}")
 else:
-    root = args.checkpoint_dir if args.checkpoint_dir is not None else args.model_dir
-    ckpt_path = join('/content/VAEAC_Thesis/celeba_model/alpha_runs/alpha_inf/last (4) (2).tar' if args.use_last_checkpoint else '/content/VAEAC_Thesis/celeba_model/alpha_runs/alpha_inf/best (4) (1).tar')
-
-
-print(f"[INFO] Loading checkpoint: {ckpt_path}")
-checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
-model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"[INFO] Using fixed alpha value: {kl_alpha}")
 
 # ---------------- DATA ----------------
 dataset = load_dataset(args.dataset)
@@ -115,4 +121,5 @@ for batch, masks in iterator:
         img_id += 1
 
 print(f"[INFO] Inpainting complete. Results saved to {args.out_dir}")
+
 
