@@ -1,7 +1,24 @@
 import torch
 from tqdm import tqdm
+import torch.nn as nn
 
+class MultiTaskLogVarWeights(nn.Module):
+    def __init__(self, n_tasks=3, init_logvars=None):
+        super().__init__()
+        # One log-variance per auxiliary task (LPIPS, Adv, Contrastive)
+        if init_logvars is None:
+            init_logvars = [0.0] * n_tasks
+        self.logvars = nn.Parameter(torch.tensor(init_logvars, dtype=torch.float32))
 
+    def get_sigmas(self):
+        return torch.exp(0.5 * self.logvars)
+
+    def get_weights(self):
+        return 1.0 / (2.0 * torch.exp(self.logvars))
+
+    def regularization(self):
+        # Sum of log(sigmas) for normalization, as in Kendall et al.
+        return self.logvars.sum()
 
 
 def extend_batch(batch, dataloader, batch_size):

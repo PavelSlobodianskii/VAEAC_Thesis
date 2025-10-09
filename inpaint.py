@@ -37,7 +37,7 @@ args = p.parse_args()
 
 # ---------------- SETUP ----------------
 use_cuda = torch.cuda.is_available()
-num_workers = 4
+num_workers = 8
 verbose = True
 
 # import the networks

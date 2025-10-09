@@ -1,3 +1,5 @@
+# filename: FID.py
+
 import argparse
 import os
 import re
@@ -13,14 +15,15 @@ from skimage.metrics import structural_similarity as ssim, peak_signal_noise_rat
 from torch_fidelity import calculate_metrics
 import matplotlib.pyplot as plt
 import csv
+import random
 
-# === Image loading helper ===
 def load_image(path):
     img = Image.open(path).convert("RGB").resize((128, 128), Image.BICUBIC)
     return transforms.ToTensor()(img).unsqueeze(0)  # [1, 3, H, W]
 
 def apply_mask(img, mask):
-    return img * mask + 0.5 * (1 - mask)  # masked region set to gray
+    # Masked pixels set to gray (0.5)
+    return img * mask + 0.5 * (1 - mask)
 
 def extract_common_ids(gt_dir, sample_dir, mask_dir):
     id_rx = re.compile(r"(\d{5})")
@@ -29,13 +32,14 @@ def extract_common_ids(gt_dir, sample_dir, mask_dir):
     mask_ids   = {id_rx.search(f.name).group(1) for f in mask_dir.iterdir() if "input" in f.name}
     return sorted(gt_ids & sample_ids & mask_ids)
 
-def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv"):
+def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv", n_show_triplets=3):
     gt_dir = Path(gt_dir)
     sample_dir = Path(sample_dir)
     mask_dir = Path(mask_dir)
 
     common_ids = extract_common_ids(gt_dir, sample_dir, mask_dir)
     assert common_ids, "No matching image IDs found in all 3 sets"
+    print(f"[INFO] Found {len(common_ids)} matched samples for evaluation.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loss_fn = lpips.LPIPS(net='alex').to(device)
@@ -46,7 +50,8 @@ def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv"):
     fid_fake_dir.mkdir(parents=True, exist_ok=True)
     fid_real_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] Evaluating {len(common_ids)} images...")
+    # For reporting/visualization: store some triplets
+    triplet_images = []
 
     for i, img_id in enumerate(common_ids):
         gt_path     = gt_dir / f"{img_id}_groundtruth.jpg"
@@ -57,7 +62,8 @@ def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv"):
         sample = load_image(sample_path).to(device)
         mask   = load_image(mask_path).to(device)
 
-        mask_bin = (mask.mean(dim=1, keepdim=True) > 0.6).float()  # 1 where visible, 0 where masked
+        # 1 = visible, 0 = masked
+        mask_bin = (mask.mean(dim=1, keepdim=True) > 0.5).float()
 
         masked_gt     = apply_mask(gt, mask_bin)
         masked_sample = apply_mask(sample, mask_bin)
@@ -75,6 +81,14 @@ def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv"):
         sample_np = masked_sample.squeeze().permute(1, 2, 0).cpu().numpy()
         ssim_scores.append(ssim(gt_np, sample_np, data_range=1.0, channel_axis=2))
         psnr_scores.append(psnr(gt_np, sample_np, data_range=1.0))
+
+        # Store for visualization (random n_show_triplets only)
+        if n_show_triplets > 0 and len(triplet_images) < n_show_triplets:
+            triplet_images.append((
+                gt.squeeze().cpu(), 
+                sample.squeeze().cpu(), 
+                mask_bin.squeeze().cpu()
+            ))
 
     # Masked FID
     fid_result = calculate_metrics(
@@ -94,9 +108,11 @@ def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv"):
         writer.writerow(["Mean", np.mean(ssim_scores), np.mean(psnr_scores), np.mean(lpips_scores)])
         writer.writerow(["FID_masked", "", "", fid_value])
 
+    # Console report
     print(f"[RESULT] Masked FID = {fid_value:.2f} | LPIPS = {np.mean(lpips_scores):.4f} | SSIM = {np.mean(ssim_scores):.4f} | PSNR = {np.mean(psnr_scores):.2f} dB")
+    print(f"[INFO] Saved CSV: {output_csv}")
 
-    # Plotting
+    # Plotting (per-image scores)
     plt.figure(figsize=(12, 5))
     plt.subplot(1, 3, 1)
     plt.plot(lpips_scores, label="LPIPS")
@@ -120,15 +136,28 @@ def evaluate_all(gt_dir, sample_dir, mask_dir, output_csv="masked_metrics.csv"):
     plt.savefig("masked_metrics_plot.png")
     print("[INFO] Plots saved as masked_metrics_plot.png")
 
+    # Optional: visualize some GT/Sample/Mask triplets
+    if len(triplet_images) > 0:
+        fig, axs = plt.subplots(len(triplet_images), 3, figsize=(9, 3 * len(triplet_images)))
+        for i, (gt, sample, mask) in enumerate(triplet_images):
+            axs[i, 0].imshow(gt.permute(1,2,0)); axs[i, 0].set_title("Ground Truth"); axs[i,0].axis('off')
+            axs[i, 1].imshow(sample.permute(1,2,0)); axs[i,1].set_title("Sample"); axs[i,1].axis('off')
+            axs[i, 2].imshow(mask, cmap="gray"); axs[i,2].set_title("Mask"); axs[i,2].axis('off')
+        plt.tight_layout()
+        plt.savefig("random_triplets.png")
+        print("[INFO] Saved sample triplet visualizations as random_triplets.png")
+
 # === Entry Point ===
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Evaluate Masked FID, SSIM, PSNR, LPIPS")
-    parser.add_argument("--gt_dir", required=True)
-    parser.add_argument("--sample_dir", required=True)
-    parser.add_argument("--mask_dir", required=True)
-    parser.add_argument("--output_csv", default="masked_metrics.csv")
+    parser.add_argument("--gt_dir", required=True, help="Directory with ground-truth images (suffix '_groundtruth.jpg')")
+    parser.add_argument("--sample_dir", required=True, help="Directory with generated samples (suffix '_sample_000.jpg')")
+    parser.add_argument("--mask_dir", required=True, help="Directory with mask images (suffix '_input.jpg')")
+    parser.add_argument("--output_csv", default="masked_metrics.csv", help="Output CSV with metrics")
+    parser.add_argument("--show_triplets", type=int, default=3, help="Number of random GT/Sample/Mask triplets to visualize")
     args = parser.parse_args()
 
     print("[INFO] Starting full masked evaluation")
-    evaluate_all(args.gt_dir, args.sample_dir, args.mask_dir, args.output_csv)
+    evaluate_all(args.gt_dir, args.sample_dir, args.mask_dir, args.output_csv, n_show_triplets=args.show_triplets)
+
 
