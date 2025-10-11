@@ -1,6 +1,3 @@
-# filename: train.py
-# filename: train.py
-
 import os
 import random
 import csv
@@ -8,7 +5,7 @@ import pickle
 from math import ceil
 from os.path import exists, join
 from shutil import copy
-from os import replace      # <--- THIS FIXES YOUR BUG
+from os import replace
 from argparse import ArgumentParser
 from importlib import import_module
 
@@ -22,11 +19,40 @@ import matplotlib.pyplot as plt
 
 import lpips  # pip install lpips
 
-from datasets import load_dataset, LengthBounder
-from train_utils import extend_batch, get_validation_iwae, make_mask_on_batch_device
-from VAEAC import VAEAC
-from metrics import compute_fid, compute_ssim_psnr
-from viz import tsne_latents
+# ---------------- GradNorm -----------------
+class GradNormLoss(nn.Module):
+    def __init__(self, n_tasks, alpha=0.5):
+        super().__init__()
+        self.alpha = alpha
+        self.log_weights = nn.Parameter(torch.zeros(n_tasks, dtype=torch.float32))
+        self.initial_task_losses = None
+
+    def get_weights(self):
+        return F.softplus(self.log_weights)
+
+    def forward(self, losses, shared_params, step, reset_l0=False):
+        n_tasks = len(losses)
+        weights = self.get_weights()
+        normed_grads = []
+        for i, loss in enumerate(losses):
+            grads = torch.autograd.grad(loss, shared_params, retain_graph=True, allow_unused=True)
+            grads = [g for g in grads if g is not None]
+            if len(grads) == 0:
+                normed_grads.append(torch.tensor(0.0, device=weights.device))
+                continue
+            grad_norm = torch.cat([g.detach().view(-1) for g in grads]).norm()
+            normed_grads.append(grad_norm)
+        normed_grads = torch.stack(normed_grads)
+
+        if (self.initial_task_losses is None) or reset_l0:
+            self.initial_task_losses = torch.tensor([l.item() for l in losses], device=weights.device)
+
+        L_ratios = torch.tensor([l.item() / l0 for l, l0 in zip(losses, self.initial_task_losses)], device=weights.device)
+        avg_ratio = L_ratios.mean()
+        target_norms = normed_grads.mean() * (L_ratios / avg_ratio) ** self.alpha
+
+        loss_gradnorm = F.l1_loss(normed_grads, target_norms.detach(), reduction='sum')
+        return loss_gradnorm
 
 def set_seed(seed: int = 1337):
     random.seed(seed)
@@ -66,6 +92,12 @@ class NTXentLoss(nn.Module):
         labels = torch.zeros(2*batch_size, dtype=torch.long, device=z_i.device)
         loss = F.cross_entropy(logits, labels)
         return loss
+
+from datasets import load_dataset, LengthBounder
+from train_utils import extend_batch, get_validation_iwae, make_mask_on_batch_device
+from VAEAC import VAEAC
+from metrics import compute_fid, compute_ssim_psnr
+from viz import tsne_latents
 
 def parse_alpha_token(tok: str):
     tok = tok.strip().lower()
@@ -115,14 +147,15 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
         free_bits=args.free_bits,
     ).to(device if torch.cuda.is_available() else "cpu")
 
-    optimizer = model_module.optimizer(model.parameters())
+    gradnorm = GradNormLoss(n_tasks=3, alpha=0.5).to(device)
+    params = list(model.parameters()) + list(gradnorm.parameters())
+    optimizer = model_module.optimizer(params)
     sampler = getattr(model_module, "sampler")
     vlb_scale = getattr(model_module, "vlb_scale_factor", 1)
     mask_gen = model_module.mask_generator
 
     last_ckpt = join(out_root, "last.tar")
     validation_iwae, train_vlb, rec_errors, kl_terms, alpha_log = [], [], [], [], []
-    # For batch-level loss tracking:
     epoch_loss_logs = []
     start_epoch = 0
     if exists(last_ckpt):
@@ -134,13 +167,16 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
         rec_errors = ckpt.get("rec_errors", [])
         kl_terms = ckpt.get("kl_terms", [])
         alpha_log = ckpt.get("alpha_log", [])
+        if "gradnorm_state_dict" in ckpt:
+            gradnorm.load_state_dict(ckpt["gradnorm_state_dict"])
         start_epoch = ckpt.get("epoch", 0) + 1
 
     csv_path = join(out_root, "metrics_alphas.csv")
     if not exists(csv_path):
         with open(csv_path, "w", newline="") as f:
             csv.writer(f).writerow(
-                ["epoch", "step", "split", "train_vlb", "val_iwae", "recon", "kl", "fid", "ssim", "psnr", "alpha", "lr"]
+                ["epoch", "step", "split", "train_vlb", "val_iwae", "recon", "kl", "fid", "ssim", "psnr", "alpha",
+                 "gradnorm_weight_lpips", "gradnorm_weight_contrastive", "gradnorm_weight_adv", "lr"]
             )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and torch.cuda.is_available()))
@@ -160,16 +196,26 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             "rec_errors": rec_errors,
             "kl_terms": kl_terms,
             "alpha_log": alpha_log,
-            "loss_logs": epoch_loss_logs,  # save all batch loss logs for the epoch
+            "loss_logs": epoch_loss_logs,
+            "gradnorm_state_dict": gradnorm.state_dict(),
         }, tmp)
         replace(tmp, last_ckpt)
 
+    def get_phase(epoch):
+        if epoch < args.phase1_epochs:
+            return 1
+        elif epoch < args.phase1_epochs + args.phase2_epochs:
+            return 2
+        else:
+            return 3
+
     for epoch in range(start_epoch, args.epochs):
-        iterator = tqdm(dl, desc=f"[{alpha_cfg['name']}] Epoch {epoch+1}/{args.epochs}") if args.verbose else dl
+        phase = get_phase(epoch)
+        iterator = tqdm(dl, desc=f"[{alpha_cfg['name']}] Epoch {epoch+1}/{args.epochs} (Phase {phase})") if args.verbose else dl
         avg_vlb = 0.0
         last_batch = last_mask = None
+        last_q = last_p = last_z = last_rec_params = None
         loss_logs = []
-
         for i, batch in enumerate(iterator):
             if any([i == 0 and epoch == start_epoch, i % validation_batches == validation_batches - 1, i + 1 == len(dl)]):
                 val_i = get_validation_iwae(val_dl, mask_gen, model_module.batch_size, model,
@@ -183,15 +229,14 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                     copy(last_ckpt, tmp)
                     replace(tmp, best_path)
                 with open(csv_path, "a", newline="") as f:
-                    csv.writer(f).writerow([epoch+1, i, "val", avg_vlb, val_i, "", "", "", "", "", "", optimizer.param_groups[0]["lr"]])
+                    weights = gradnorm.get_weights().detach().cpu().numpy()
+                    csv.writer(f).writerow([epoch+1, i, "val", avg_vlb, val_i, "", "", "", "", "", "",
+                        weights[0], weights[1], weights[2], optimizer.param_groups[0]["lr"]])
 
             batch = extend_batch(batch, dl, model_module.batch_size)
             mask = mask_gen(batch)
-            mask = mask.to(batch.device)
-
-            if torch.cuda.is_available():
-                batch = batch.cuda(non_blocking=True)
-                mask = mask.cuda(non_blocking=True)
+            batch = batch.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=(args.amp and torch.cuda.is_available())):
@@ -207,28 +252,36 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                 gt_img_lpips = (gt_img * 2 - 1).clamp(-1, 1)
                 lpips_loss = lpips_loss_fn(rec_img_lpips, gt_img_lpips).mean()
 
-                # Discriminator update
-                real_out = discriminator(gt_img)
-                fake_out = discriminator(rec_img.detach())
-                d_loss = (F.binary_cross_entropy_with_logits(real_out, torch.ones_like(real_out)) +
-                          F.binary_cross_entropy_with_logits(fake_out, torch.zeros_like(fake_out))) * 0.5
-                d_optimizer.zero_grad()
-                d_loss.backward()
-                d_optimizer.step()
-                adv_logits = discriminator(rec_img)
-                adv_loss = F.binary_cross_entropy_with_logits(adv_logits, torch.ones_like(adv_logits))
+                aux_losses, aux_names = [lpips_loss], ["lpips"]
+                contrastive_loss = torch.tensor(0.0, device=batch.device)
+                adv_loss = torch.tensor(0.0, device=batch.device)
 
-                mask2 = mask_gen(batch)
-                mask2 = mask2.to(batch.device)
-                q2, _ = model.make_latent_distributions(batch, mask2)
-                z1 = z.view(batch.size(0), -1)
-                z2 = q2.rsample().view(batch.size(0), -1)
-                contrastive_loss = nt_xent_loss_fn(z1, z2)
+                if phase >= 2:
+                    mask2 = mask_gen(batch)
+                    mask2 = mask2.to(device, non_blocking=True)
+                    q2, _ = model.make_latent_distributions(batch, mask2)
+                    z1 = z.view(batch.size(0), -1)
+                    z2 = q2.rsample().view(batch.size(0), -1)
+                    contrastive_loss = nt_xent_loss_fn(z1, z2)
+                    aux_losses.append(contrastive_loss)
+                    aux_names.append("contrastive")
+                if phase == 3:
+                    real_out = discriminator(gt_img)
+                    fake_out = discriminator(rec_img.detach())
+                    d_loss = (F.binary_cross_entropy_with_logits(real_out, torch.ones_like(real_out)) +
+                              F.binary_cross_entropy_with_logits(fake_out, torch.zeros_like(fake_out))) * 0.5
+                    d_optimizer.zero_grad()
+                    d_loss.backward()
+                    d_optimizer.step()
+                    adv_logits = discriminator(rec_img)
+                    adv_loss = F.binary_cross_entropy_with_logits(adv_logits, torch.ones_like(adv_logits))
+                    aux_losses.append(adv_loss)
+                    aux_names.append("adversarial")
 
-                lambda_perc = 0.05
-                lambda_adv = 0.05
-                lambda_con = 0.1
-                total_loss = elbo_loss + lambda_perc * lpips_loss + lambda_adv * adv_loss + lambda_con * contrastive_loss
+                shared_params = [p for n, p in model.named_parameters() if "generative_network" in n]
+                gradnorm_loss = gradnorm(aux_losses, shared_params, i, reset_l0=(i==0))
+                total_aux = sum(w * l for w, l in zip(gradnorm.get_weights()[:len(aux_losses)], aux_losses))
+                total_loss = elbo_loss + total_aux + gradnorm_loss
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -238,77 +291,73 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                 rec = float(model.rec_log_prob(batch, rec_params, mask).mean().item())
                 kl = float(torch.distributions.kl_divergence(q, p).view(batch.shape[0], -1).sum(-1).mean().item())
                 alpha_val = float(model._alpha_value().item())
-                # Log all loss terms per batch
+                weights = gradnorm.get_weights().detach().cpu().numpy()
                 logdict = {
                     "elbo_loss": float(elbo_loss.item()),
                     "lpips_loss": float(lpips_loss.item()),
-                    "adv_loss": float(adv_loss.item()),
-                    "contrastive_loss": float(contrastive_loss.item()),
+                    "contrastive_loss": float(contrastive_loss.item() if phase >= 2 else 0.),
+                    "adv_loss": float(adv_loss.item() if phase == 3 else 0.),
                     "total_loss": float(total_loss.item()),
                     "rec": rec,
                     "kl": kl,
-                    "alpha": alpha_val
+                    "alpha": alpha_val,
+                    "gradnorm_weight_lpips": weights[0],
+                    "gradnorm_weight_contrastive": weights[1] if phase >= 2 else 0.,
+                    "gradnorm_weight_adv": weights[2] if phase == 3 else 0.
                 }
                 loss_logs.append(logdict)
                 rec_errors.append(rec)
                 kl_terms.append(kl)
                 alpha_log.append(alpha_val)
+                # Save last batch and outputs for summary printing
+                last_batch, last_mask, last_q, last_p, last_z, last_rec_params = batch, mask, q, p, z, rec_params
             avg_vlb += (float(vlb) - avg_vlb) / (i + 1)
             if args.verbose and isinstance(iterator, tqdm):
                 iterator.set_postfix(vlb=f"{avg_vlb:.1f}", alpha=alpha_val)
-            last_batch, last_mask = batch, mask
 
         # Save batch losses for this epoch
         epoch_loss_logs.extend(loss_logs)
         with open(join(out_root, f"loss_logs_epoch_{epoch+1}.pkl"), "wb") as f:
             pickle.dump(loss_logs, f)
 
-        with torch.no_grad():
-            q, p = model.make_latent_distributions(last_batch, last_mask)
-            z = q.rsample()
-            rec_params = model.generative_network(z)
+        # Plot GradNorm weights at epoch end
+        weights_arr = np.stack([
+            [log.get("gradnorm_weight_lpips", 0) for log in loss_logs],
+            [log.get("gradnorm_weight_contrastive", 0) for log in loss_logs],
+            [log.get("gradnorm_weight_adv", 0) for log in loss_logs]
+        ], axis=1)
+        plt.figure(figsize=(10,5))
+        plt.plot(weights_arr[:,0], label="GradNorm LPIPS")
+        plt.plot(weights_arr[:,1], label="GradNorm Contrastive")
+        plt.plot(weights_arr[:,2], label="GradNorm Adversarial")
+        plt.legend(), plt.grid(True, alpha=0.3)
+        plt.title(f"GradNorm Weights (epoch {epoch+1})")
+        plt.tight_layout()
+        plt.savefig(join(out_root, f"gradnorm_weights_epoch_{epoch+1}.png"))
+        plt.close()
 
+        # ---- Epoch summary block: Shapes and weights ----
         bar = "-" * 72
         print(f"+{bar}+")
         print(f"| Alpha: {alpha_cfg['name']:<20} | Epoch: {epoch+1}/{args.epochs:<4} | Avg VLB: {avg_vlb:>10.3f} |")
         print(f"+{bar}+")
-        print(f"| Batch           : {tuple(last_batch.shape)}")
-        print(f"| Mask            : {tuple(last_mask.shape)}")
-        print(f"| q.mean          : {tuple(q.mean.shape)}")
-        print(f"| p.mean          : {tuple(p.mean.shape)}")
-        print(f"| z               : {tuple(z.shape)}")
-        print(f"| rec_params      : {tuple(rec_params.shape)}")
+        print(f"| Batch           : {tuple(last_batch.shape) if last_batch is not None else 'N/A'}")
+        print(f"| Mask            : {tuple(last_mask.shape) if last_mask is not None else 'N/A'}")
+        print(f"| q.mean          : {tuple(getattr(last_q, 'mean', torch.empty(0)).shape) if last_q is not None else 'N/A'}")
+        print(f"| p.mean          : {tuple(getattr(last_p, 'mean', torch.empty(0)).shape) if last_p is not None else 'N/A'}")
+        print(f"| z               : {tuple(getattr(last_z, 'shape', torch.empty(0).shape)) if last_z is not None else 'N/A'}")
+        print(f"| rec_params      : {tuple(last_rec_params.shape) if last_rec_params is not None else 'N/A'}")
+        gradnorm_weights = gradnorm.get_weights().detach().cpu().numpy()
+        print(f"| gradnorm_weight_lpips       : {gradnorm_weights[0]:>10.4f}")
+        print(f"| gradnorm_weight_contrastive : {gradnorm_weights[1]:>10.4f}")
+        print(f"| gradnorm_weight_adv         : {gradnorm_weights[2]:>10.4f}")
         print(f"+{bar}+")
 
-        fid_score = ssim = psnr = None
-        if args.compute_fid or args.compute_ssimpsnr:
-            val_it = iter(val_dl)
-            try: vb = next(val_it)
-            except StopIteration:
-                val_it = iter(val_dl); vb = next(val_it)
-            vb = vb.cuda() if torch.cuda.is_available() else vb
-            vmask = make_mask_on_batch_device(mask_gen, vb)
-            with torch.no_grad():
-                params = model.generate_samples_params(vb, vmask, K=1)
-                gen = sampler(params[:, 0])
-            if args.compute_fid:
-                fid_score = compute_fid(gen, vb, device=("cuda" if torch.cuda.is_available() else "cpu"))
-            if args.compute_ssimpsnr:
-                ssim, psnr = compute_ssim_psnr(gen, vb)
-
-        with open(csv_path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch+1, "epoch_end", "train", avg_vlb, "", "", "", fid_score, ssim, psnr, alpha_val, optimizer.param_groups[0]["lr"]])
-
-        with torch.no_grad():
-            lat_means = model.latent_means(last_batch, last_mask).cpu().numpy()
-        np.savez_compressed(join(out_root, f"latents_epoch_{epoch+1}_alphas.npz"), latents=lat_means)
-        if args.tsne_every and ((epoch + 1) % args.tsne_every == 0):
-            tsne_latents(lat_means, labels=None, out_path=join(out_root, f"tsne_epoch_{epoch+1}_alphas.png"))
+        # (optional) Plot or print other diagnostics
 
     # Save all batch losses for all epochs
     with open(join(out_root, "all_loss_logs.pkl"), "wb") as f:
         pickle.dump(epoch_loss_logs, f)
-
     print(f"[INFO] ({alpha_cfg['name']}) training complete – saving history & plots…")
     with open(join(out_root, "history.pkl"), "wb") as f:
         pickle.dump(
@@ -316,48 +365,20 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             f,
         )
 
-    # (a) Train VLB vs Val IWAE
-    plt.figure(figsize=(14, 6))
-    plt.plot(validation_iwae, label="Validation IWAE", marker="o")
-    plt.plot(train_vlb, label="Train VLB", marker="x")
-    plt.xlabel("Validation checkpoint")
-    plt.ylabel("Loss / Value")
-    plt.title(f"[{alpha_cfg['name']}] Validation IWAE and Train VLB")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(join(out_root, "loss_curves.png"), dpi=200)
-    plt.close()
-
-    # (b) Reconstruction & KL per batch
-    plt.figure(figsize=(14, 6))
-    plt.plot(rec_errors, label="Reconstruction Error", linestyle="--")
-    plt.plot(kl_terms, label="KL Divergence", linestyle="-.")
-    plt.xlabel("Batch")
-    plt.ylabel("Loss / Value")
-    plt.title(f"[{alpha_cfg['name']}] Reconstruction Error and KL (per batch)")
-    plt.grid(True, linestyle="--", alpha=0.5)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(join(out_root, "recon_kl_per_batch.png"), dpi=200)
-    plt.close()
-
-    # (c) Plot all auxiliary losses over all batches (optional)
-    # You can later load all_loss_logs.pkl and plot in a separate notebook as needed
-
 if __name__ == "__main__":
-    p = ArgumentParser("Train ORIGINAL VAEAC with multiple KL weights/variants.")
+    p = ArgumentParser("Train VAEAC + GradNorm + Staged Strategy")
     p.add_argument("--model_dir", type=str, required=True)
-    p.add_argument("--epochs", type=int, required=True)
+    p.add_argument("--epochs", type=int, default=25)
     p.add_argument("--train_dataset", type=str, required=True)
     p.add_argument("--validation_dataset", type=str, required=True)
-    p.add_argument("--alphas", type=str, default="0,0.5,1,inf,-inf,learnable,symmetric",
-        help='Comma-separated: e.g. "0,0.5,1,inf,-inf,learnable,symmetric,symmetric:0.5"')
-    p.add_argument("--max_train_images", type=int, default=25000)
+    p.add_argument("--alphas", type=str, default="1.0")
+    p.add_argument("--max_train_images", type=int, default=45000)
     p.add_argument("--validation_iwae_num_samples", type=int, default=25)
     p.add_argument("--validations_per_epoch", type=int, default=5)
+    p.add_argument("--phase1_epochs", type=int, default=10)
+    p.add_argument("--phase2_epochs", type=int, default=8)
     p.add_argument("--seed", type=int, default=1337)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--verbose", action="store_true", default=True)
     p.add_argument("--compute_fid", action="store_true", default=False)
     p.add_argument("--compute_ssimpsnr", action="store_true", default=False)
@@ -378,6 +399,8 @@ if __name__ == "__main__":
     print("[INFO] KL variants to run:", ", ".join([c["name"] for c in cfgs]))
     for cfg in cfgs:
         run_one_alpha(args, cfg, device=device)
+
+
 
 
 

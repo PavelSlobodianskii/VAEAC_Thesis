@@ -54,7 +54,17 @@ else:
     ckpt_path = join("/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/last.tar" if args.use_last_checkpoint else "/content/VAEAC_Thesis/celeba_model/alpha_runs/learnable/best.tar")
 
 print(f"[INFO] Loading checkpoint: {ckpt_path}")
-checkpoint = torch.load(ckpt_path, map_location=('cuda' if use_cuda else 'cpu'))
+
+import torch.serialization
+torch.serialization.add_safe_globals([__import__('numpy')._core.multiarray.scalar])
+
+checkpoint = torch.load(
+    ckpt_path,
+    map_location=('cuda' if use_cuda else 'cpu'),
+    weights_only=True  # <---- add this argument!
+)
+
+
 
 # Detect if alpha was learnable during training from the checkpoint
 learnable_alpha = "raw_alpha" in checkpoint["model_state_dict"]
