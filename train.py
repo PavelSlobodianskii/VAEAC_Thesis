@@ -1,4 +1,5 @@
-# train.py — VAEAC with PCGrad/Gradient Surgery + logvar weighting + full logging
+# train.py — VAEAC with PCGrad/Gradient Surgery + logvar weighting + full logging & gradient norm tracking
+
 import os, random, csv, pickle
 from math import ceil
 from os.path import exists, join
@@ -91,7 +92,6 @@ def parse_alpha_token(tok: str):
     return dict(name=f"alpha_{val}", kl_mode="standard", kl_alpha=val, learnable_alpha=False)
 
 def pc_backward(losses, parameters, optimizer, scaler=None):
-    optimizer.zero_grad(set_to_none=True)
     grads = []
     for loss in losses:
         optimizer.zero_grad(set_to_none=True)
@@ -100,27 +100,40 @@ def pc_backward(losses, parameters, optimizer, scaler=None):
     optimizer.zero_grad(set_to_none=True)
     logs = {"cosines": []}
     for i in range(1, len(losses)):
-        grad_i = grads[i]
         for j in range(1, len(losses)):
             if i == j: continue
-            dot = norm_sq = 0.
-            for gi, gj in zip(grad_i, grads[j]):
-                if gi is not None and gj is not None:
-                    dot += (gi * gj).sum().item()
-                    norm_sq += (gj * gj).sum().item()
+            g1, g2 = grads[i], grads[j]
+            dot, norm_sq = 0., 0.
+            for a, b in zip(g1, g2):
+                if a is not None and b is not None:
+                    dot += (a * b).sum().item()
+                    norm_sq += (b * b).sum().item()
             if dot < 0 and norm_sq > 0:
-                for k in range(len(grad_i)):
-                    if grad_i[k] is not None and grads[j][k] is not None:
-                        grad_i[k] -= (dot / (norm_sq + 1e-8)) * grads[j][k]
+                for k in range(len(g1)):
+                    if g1[k] is not None and g2[k] is not None:
+                        g1[k] -= (dot / (norm_sq + 1e-8)) * g2[k]
             logs["cosines"].append(dot / (norm_sq ** 0.5 + 1e-8) if norm_sq > 0 else 0.)
-    for p in parameters: p.grad = None
+    for p in parameters:
+        p.grad = None
     for i, p in enumerate(parameters):
-        g_sum = None
+        gsum = None
         for g in grads:
             if g[i] is not None:
-                g_sum = g[i] if g_sum is None else g_sum + g[i]
-        if g_sum is not None: p.grad = g_sum.clone()
+                gsum = g[i] if gsum is None else gsum + g[i]
+        if gsum is not None:
+            p.grad = gsum.clone()
     return logs
+
+# ----------- GRADIENT LOGGING -----------
+def get_grad_norms(model_params, logvar_params):
+    # Compute L2 norm for all, model, and logvar separately
+    def norm(p_list):
+        return float(torch.sqrt(sum([(p.grad**2).sum() for p in p_list if p.grad is not None])).item()) if p_list else 0.0
+    model_norm = norm(model_params)
+    logvar_norm = norm(logvar_params)
+    total_norm = norm(model_params + logvar_params)
+    return {"grad_total": total_norm, "grad_model": model_norm, "grad_logvar": logvar_norm}
+# ----------------------------------------
 
 def run_one_alpha(args, alpha_cfg, device="cuda"):
     model_module = import_module(args.model_dir + '.model')
@@ -138,9 +151,17 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
         debug_asserts=args.debug_asserts, kl_mode=alpha_cfg["kl_mode"], kl_alpha=alpha_cfg["kl_alpha"], learnable_alpha=alpha_cfg["learnable_alpha"],
         alpha_init=args.alpha_init, alpha_max=args.alpha_max, free_bits=args.free_bits,
     ).to(device if torch.cuda.is_available() else "cpu")
-    logvar_weights = MultiTaskLogVarWeights(n_tasks=3, init_logvars=[-2.0, -2.0, -2.0]).to(device)
-    params = list(model.parameters()) + list(logvar_weights.parameters())
-    optimizer = model_module.optimizer(params)
+    # --- ADVANCED PARAM GROUPS ---
+    logvar_weights = MultiTaskLogVarWeights(n_tasks=3, init_logvars=[-3.0, -3.0, -3.0]).to(device)
+    model_params = list(model.parameters())
+    logvar_params = list(logvar_weights.parameters())
+    param_groups = [
+        {"params": model_params, "lr": 2e-4},
+        {"params": logvar_params, "lr": 4e-4}
+    ]
+    optimizer = torch.optim.Adam(param_groups)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs) if getattr(args, "use_scheduler", False) else None
+    # ---
     sampler = getattr(model_module, "sampler")
     vlb_scale = getattr(model_module, "vlb_scale_factor", 1)
     mask_gen = model_module.mask_generator
@@ -161,6 +182,8 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
         if "logvar_weights_state_dict" in ckpt:
             logvar_weights.load_state_dict(ckpt["logvar_weights_state_dict"])
         start_epoch = ckpt.get("epoch", 0) + 1
+        if scheduler is not None and "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
 
     csv_path = join(out_root, "metrics_alphas.csv")
     if not exists(csv_path):
@@ -168,7 +191,8 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             csv.writer(f).writerow(
                 ["epoch", "step", "split", "train_vlb", "val_iwae", "recon", "kl", "fid", "ssim", "psnr", "alpha",
                  "logvar_lpips", "logvar_adv", "logvar_con", "weight_lpips", "weight_adv", "weight_con", "lr",
-                 "pc_cosine_lpips_adv", "pc_cosine_lpips_con", "pc_cosine_adv_con"])
+                 "pc_cosine_lpips_adv", "pc_cosine_lpips_con", "pc_cosine_adv_con",
+                 "grad_total", "grad_model", "grad_logvar"])
 
     lpips_loss_fn = lpips.LPIPS(net='vgg').to(device)
     discriminator = PatchDiscriminator(in_channels=3).to(device)
@@ -189,6 +213,7 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             "alpha_log": alpha_log,
             "loss_logs": epoch_loss_logs,
             "logvar_weights_state_dict": logvar_weights.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None
         }, tmp)
         replace(tmp, last_ckpt)
 
@@ -209,7 +234,7 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                     copy(last_ckpt, tmp)
                     replace(tmp, best_path)
                 with open(csv_path, "a", newline="") as f:
-                    csv.writer(f).writerow([epoch+1, i, "val", avg_vlb, val_i, "", "", "", "", "", "", "", "", "", "", "", "", optimizer.param_groups[0]["lr"], "", "", ""])
+                    csv.writer(f).writerow([epoch+1, i, "val", avg_vlb, val_i, "", "", "", "", "", "", "", "", "", "", "", "", optimizer.param_groups[0]["lr"], "", "", "", "", "", ""])
 
             batch = extend_batch(batch, dl, model_module.batch_size)
             mask = mask_gen(batch)
@@ -261,7 +286,7 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                     weighted_adv   = w_adv   * adv_loss   + 0.5 * logvar_weights.logvars[1]
                     weighted_con   = w_con   * contrastive_loss + 0.5 * logvar_weights.logvars[2]
                     loss_list = [elbo_loss, weighted_lpips, weighted_adv, weighted_con]
-                    pcgrad_logs = pc_backward(loss_list, params, optimizer, scaler=None)
+                    pcgrad_logs = pc_backward(loss_list, model_params + logvar_params, optimizer, scaler=None)
                 optimizer.step()
             else:
                 vlb = model.batch_vlb(batch, mask).mean()
@@ -289,8 +314,13 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                 weighted_adv   = w_adv   * adv_loss   + 0.5 * logvar_weights.logvars[1]
                 weighted_con   = w_con   * contrastive_loss + 0.5 * logvar_weights.logvars[2]
                 loss_list = [elbo_loss, weighted_lpips, weighted_adv, weighted_con]
-                pcgrad_logs = pc_backward(loss_list, params, optimizer, scaler=None)
+                pcgrad_logs = pc_backward(loss_list, model_params + logvar_params, optimizer, scaler=None)
                 optimizer.step()
+
+            # -------- GRADIENT NORM LOGGING ---------
+            grad_norms = get_grad_norms(model_params, logvar_params)
+            # ---------- SAFETY: robust cosine log handling ----------
+            pc_cosines = pcgrad_logs["cosines"] if (pcgrad_logs is not None and "cosines" in pcgrad_logs) else [None, None, None]
 
             with torch.no_grad():
                 rec = float(model.rec_log_prob(batch, rec_params, mask).mean().item())
@@ -309,9 +339,12 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                     "weight_lpips": float(w_lpips.item()),
                     "weight_adv": float(w_adv.item()),
                     "weight_con": float(w_con.item()),
-                    "pc_cosine_lpips_adv": float(pcgrad_logs["cosines"][0]) if len(pcgrad_logs["cosines"]) > 0 else None,
-                    "pc_cosine_lpips_con": float(pcgrad_logs["cosines"][1]) if len(pcgrad_logs["cosines"]) > 1 else None,
-                    "pc_cosine_adv_con": float(pcgrad_logs["cosines"][2]) if len(pcgrad_logs["cosines"]) > 2 else None,
+                    "pc_cosine_lpips_adv": float(pc_cosines[0]) if pc_cosines[0] is not None else None,
+                    "pc_cosine_lpips_con": float(pc_cosines[1]) if pc_cosines[1] is not None else None,
+                    "pc_cosine_adv_con": float(pc_cosines[2]) if pc_cosines[2] is not None else None,
+                    "grad_total": grad_norms["grad_total"],
+                    "grad_model": grad_norms["grad_model"],
+                    "grad_logvar": grad_norms["grad_logvar"],
                 }
                 loss_logs.append(logdict)
                 rec_errors.append(rec)
@@ -322,9 +355,18 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                 iterator.set_postfix(vlb=f"{avg_vlb:.1f}", alpha=alpha_val)
             last_batch, last_mask = batch, mask
 
+            # ---- Write grad norms to tqdm
+            if args.verbose and isinstance(iterator, tqdm):
+                iterator.set_postfix(vlb=f"{avg_vlb:.1f}", alpha=alpha_val,
+                                    grad_total=f"{grad_norms['grad_total']:.3g}",
+                                    grad_logvar=f"{grad_norms['grad_logvar']:.2g}")
+
         epoch_loss_logs.extend(loss_logs)
         with open(join(out_root, f"loss_logs_epoch_{epoch+1}.pkl"), "wb") as f:
             pickle.dump(loss_logs, f)
+
+        if scheduler is not None:
+            scheduler.step()
 
         with torch.no_grad():
             q, p = model.make_latent_distributions(last_batch, last_mask)
@@ -343,6 +385,8 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             print(f"| logvar_lpips : {logvar_weights.logvars[0].item():>10.4f} | weight_lpips: {torch.exp(-logvar_weights.logvars[0]).item():.4f}")
             print(f"| logvar_adv : {logvar_weights.logvars[1].item():>10.4f} | weight_adv : {torch.exp(-logvar_weights.logvars[1]).item():.4f}")
             print(f"| logvar_con : {logvar_weights.logvars[2].item():>10.4f} | weight_con : {torch.exp(-logvar_weights.logvars[2]).item():.4f}")
+            print(f"+{bar}+")
+            print(f"| grad_total: {grad_norms['grad_total']:.4f} | grad_model: {grad_norms['grad_model']:.4f} | grad_logvar: {grad_norms['grad_logvar']:.4f} |")
             print(f"+{bar}+")
 
         fid_score = ssim = psnr = None
@@ -363,15 +407,18 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             if args.compute_ssimpsnr:
                 ssim, psnr = compute_ssim_psnr(gen, vb)
 
+        # ---------- SAFETY: robust cosine log handling ----------
+        pc_cosines = pcgrad_logs["cosines"] if (pcgrad_logs is not None and "cosines" in pcgrad_logs) else [None, None, None]
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow([
                 epoch+1, "epoch_end", "train", avg_vlb, "", "", "", fid_score, ssim, psnr, alpha_val,
                 float(logvar_weights.logvars[0].item()), float(logvar_weights.logvars[1].item()), float(logvar_weights.logvars[2].item()),
                 float(torch.exp(-logvar_weights.logvars[0]).item()), float(torch.exp(-logvar_weights.logvars[1]).item()), float(torch.exp(-logvar_weights.logvars[2]).item()),
                 optimizer.param_groups[0]["lr"],
-                float(pcgrad_logs["cosines"][0]) if len(pcgrad_logs["cosines"]) > 0 else None,
-                float(pcgrad_logs["cosines"][1]) if len(pcgrad_logs["cosines"]) > 1 else None,
-                float(pcgrad_logs["cosines"][2]) if len(pcgrad_logs["cosines"]) > 2 else None,
+                float(pc_cosines[0]) if pc_cosines[0] is not None else None,
+                float(pc_cosines[1]) if pc_cosines[1] is not None else None,
+                float(pc_cosines[2]) if pc_cosines[2] is not None else None,
+                grad_norms["grad_total"], grad_norms["grad_model"], grad_norms["grad_logvar"]
             ])
 
         with torch.no_grad():
@@ -426,6 +473,7 @@ if __name__ == "__main__":
     p.add_argument("--alpha_init", type=float, default=1.0)
     p.add_argument("--alpha_max", type=float, default=1e6)
     p.add_argument("--free_bits", type=float, default=0.0)
+    p.add_argument("--use_scheduler", action="store_true", default=False)
     args = p.parse_args()
     set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
