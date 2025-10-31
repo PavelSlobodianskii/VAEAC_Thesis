@@ -1,4 +1,4 @@
-# train.py — VAEAC with PCGrad/Gradient Surgery + logvar weighting + full logging & gradient norm tracking
+# train.py — VAEAC with PCGrad/Gradient Surgery + logvar weighting + normalization + logging + gradient norm tracking
 
 import os, random, csv, pickle
 from math import ceil
@@ -152,7 +152,8 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
         alpha_init=args.alpha_init, alpha_max=args.alpha_max, free_bits=args.free_bits,
     ).to(device if torch.cuda.is_available() else "cpu")
     # --- ADVANCED PARAM GROUPS ---
-    logvar_weights = MultiTaskLogVarWeights(n_tasks=3, init_logvars=[-3.0, -3.0, -3.0]).to(device)
+    # *** Use better initial logvars ***
+    logvar_weights = MultiTaskLogVarWeights(n_tasks=3, init_logvars=[-0.5, -0.5, -0.5]).to(device)
     model_params = list(model.parameters())
     logvar_params = list(logvar_weights.parameters())
     param_groups = [
@@ -161,7 +162,6 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
     ]
     optimizer = torch.optim.Adam(param_groups)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs) if getattr(args, "use_scheduler", False) else None
-    # ---
     sampler = getattr(model_module, "sampler")
     vlb_scale = getattr(model_module, "vlb_scale_factor", 1)
     mask_gen = model_module.mask_generator
@@ -199,6 +199,11 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
     d_optimizer = torch.optim.Adam(discriminator.parameters(), lr=2e-4, betas=(0.5, 0.999))
     nt_xent_loss_fn = NTXentLoss(temperature=0.5)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and torch.cuda.is_available()))
+
+    # === CHANGE: normalization factors (from your stats, edit here as needed) ===
+    NORM_LPIPS = 0.5455
+    NORM_ADV = 2.2534
+    NORM_CON = 4.0182
 
     def save_ckpt(epoch):
         tmp = last_ckpt + ".bak"
@@ -279,12 +284,19 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                     z1 = z.view(batch.size(0), -1)
                     z2 = q2.rsample().view(batch.size(0), -1)
                     contrastive_loss = nt_xent_loss_fn(z1, z2)
+                    
+                    # --- Apply normalization to each loss ---
+                    norm_lpips_loss = lpips_loss / NORM_LPIPS
+                    norm_adv_loss = adv_loss / NORM_ADV
+                    norm_con_loss = contrastive_loss / NORM_CON
+
+                    # --- logvar-weight (Kendall) on normalized losses ---
                     w_lpips = torch.exp(-logvar_weights.logvars[0])
                     w_adv = torch.exp(-logvar_weights.logvars[1])
                     w_con = torch.exp(-logvar_weights.logvars[2])
-                    weighted_lpips = w_lpips * lpips_loss + 0.5 * logvar_weights.logvars[0]
-                    weighted_adv   = w_adv   * adv_loss   + 0.5 * logvar_weights.logvars[1]
-                    weighted_con   = w_con   * contrastive_loss + 0.5 * logvar_weights.logvars[2]
+                    weighted_lpips = w_lpips * norm_lpips_loss + 0.5 * logvar_weights.logvars[0]
+                    weighted_adv   = w_adv   * norm_adv_loss   + 0.5 * logvar_weights.logvars[1]
+                    weighted_con   = w_con   * norm_con_loss   + 0.5 * logvar_weights.logvars[2]
                     loss_list = [elbo_loss, weighted_lpips, weighted_adv, weighted_con]
                     pcgrad_logs = pc_backward(loss_list, model_params + logvar_params, optimizer, scaler=None)
                 optimizer.step()
@@ -307,19 +319,25 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
                 z1 = z.view(batch.size(0), -1)
                 z2 = q2.rsample().view(batch.size(0), -1)
                 contrastive_loss = nt_xent_loss_fn(z1, z2)
+
+                # --- Apply normalization to each loss ---
+                norm_lpips_loss = lpips_loss / NORM_LPIPS
+                norm_adv_loss = adv_loss / NORM_ADV
+                norm_con_loss = contrastive_loss / NORM_CON
+
+                # --- logvar-weight (Kendall) on normalized losses ---
                 w_lpips = torch.exp(-logvar_weights.logvars[0])
                 w_adv = torch.exp(-logvar_weights.logvars[1])
                 w_con = torch.exp(-logvar_weights.logvars[2])
-                weighted_lpips = w_lpips * lpips_loss + 0.5 * logvar_weights.logvars[0]
-                weighted_adv   = w_adv   * adv_loss   + 0.5 * logvar_weights.logvars[1]
-                weighted_con   = w_con   * contrastive_loss + 0.5 * logvar_weights.logvars[2]
+                weighted_lpips = w_lpips * norm_lpips_loss + 0.5 * logvar_weights.logvars[0]
+                weighted_adv   = w_adv   * norm_adv_loss   + 0.5 * logvar_weights.logvars[1]
+                weighted_con   = w_con   * norm_con_loss   + 0.5 * logvar_weights.logvars[2]
                 loss_list = [elbo_loss, weighted_lpips, weighted_adv, weighted_con]
                 pcgrad_logs = pc_backward(loss_list, model_params + logvar_params, optimizer, scaler=None)
                 optimizer.step()
 
             # -------- GRADIENT NORM LOGGING ---------
             grad_norms = get_grad_norms(model_params, logvar_params)
-            # ---------- SAFETY: robust cosine log handling ----------
             pc_cosines = pcgrad_logs["cosines"] if (pcgrad_logs is not None and "cosines" in pcgrad_logs) else [None, None, None]
 
             with torch.no_grad():
@@ -407,7 +425,6 @@ def run_one_alpha(args, alpha_cfg, device="cuda"):
             if args.compute_ssimpsnr:
                 ssim, psnr = compute_ssim_psnr(gen, vb)
 
-        # ---------- SAFETY: robust cosine log handling ----------
         pc_cosines = pcgrad_logs["cosines"] if (pcgrad_logs is not None and "cosines" in pcgrad_logs) else [None, None, None]
         with open(csv_path, "a", newline="") as f:
             csv.writer(f).writerow([
@@ -482,6 +499,7 @@ if __name__ == "__main__":
     print("[INFO] KL variants to run:", ", ".join([c["name"] for c in cfgs]))
     for cfg in cfgs:
         run_one_alpha(args, cfg, device=device)
+
 
 
 
